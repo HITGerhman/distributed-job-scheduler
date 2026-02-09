@@ -1,3 +1,3 @@
-# dcron
+# distributed-job-scheduler
 
-Distributed cron service (skeleton layout).
+Distributed job scheduler (skeleton layout).
