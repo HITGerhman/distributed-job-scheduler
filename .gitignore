@@ -1,0 +1,17 @@
+# Go build
+/bin
+/dist
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs
+*.log
+
+# IDE
+.idea
+.vscode
+
+# OS
+.DS_Store

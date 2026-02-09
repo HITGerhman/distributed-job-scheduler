@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package scheduler;
+
+option go_package = "dcron/api/proto;scheduler";
+
+message PingRequest {}
+message PingResponse {
+  string message = 1;
+}
+
+service Scheduler {
+  rpc Ping(PingRequest) returns (PingResponse);
+}
