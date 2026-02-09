@@ -1,4 +1,4 @@
-module dcron
+module github.com/HITGerhman/distributed-job-scheduler
 
 go 1.24.0
 

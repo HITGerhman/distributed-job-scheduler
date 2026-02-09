@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package scheduler;
 
-option go_package = "dcron/api/proto;scheduler";
+option go_package = "github.com/HITGerhman/distributed-job-scheduler/api/proto;scheduler";
 
 message PingRequest {}
 message PingResponse {
