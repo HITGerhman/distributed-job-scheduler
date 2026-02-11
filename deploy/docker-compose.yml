@@ -1,4 +1,23 @@
-version: "3.9"
+x-go-service: &go-service
+  image: golang:1.24
+  working_dir: /app
+  volumes:
+    - ..:/app
+    - go-mod-cache:/go/pkg/mod
+    - go-build-cache:/root/.cache/go-build
+  restart: unless-stopped
 
 services:
-  # TODO: add master/worker services
+  master:
+    <<: *go-service
+    command: ["go", "run", "./cmd/master"]
+
+  worker:
+    <<: *go-service
+    command: ["go", "run", "./cmd/worker"]
+    depends_on:
+      - master
+
+volumes:
+  go-mod-cache:
+  go-build-cache:
