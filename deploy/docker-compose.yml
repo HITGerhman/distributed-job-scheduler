@@ -51,7 +51,7 @@ services:
 
 volumes:
   etcd_data:
-    name: dcron_etcd_data
+    name: DJS_etcd_data
   go-mod-cache:
   go-build-cache:
     

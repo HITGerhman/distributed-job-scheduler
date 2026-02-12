@@ -1,4 +1,4 @@
-# dcron 部署排查备忘（2026-02-11）
+# DJS 部署排查备忘（2026-02-11）
 
 ## 已完成事项
 
@@ -22,6 +22,5 @@
    - `docker pull golang:1.24` 成功
    - `docker compose -f deploy/docker-compose.yml up -d --build` 成功启动 `master`/`worker`
 5. 验证etcd可复用
-
 
 
