@@ -38,6 +38,24 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+  mysql:
+    image: mysql:8.4
+    container_name: mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: 172600
+      MYSQL_DATABASE: DJS
+      MYSQL_USER: DJS
+      MYSQL_PASSWORD: 172600
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p172600"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   master:
     <<: *go-service
@@ -52,6 +70,7 @@ services:
 volumes:
   etcd_data:
     name: DJS_etcd_data
+  mysql_data:
   go-mod-cache:
   go-build-cache:
     
