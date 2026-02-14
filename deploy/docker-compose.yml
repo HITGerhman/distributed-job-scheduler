@@ -12,32 +12,25 @@ services:
     image: quay.io/coreos/etcd:v3.5.11
     container_name: etcd
     restart: unless-stopped
-
     environment:
       ETCD_NAME: etcd0
       ETCD_DATA_DIR: /etcd-data
-
-
-      # client
       ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
       ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
-
-            # peer（先留着，后续做多节点会用到）
       ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
       ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd:2380
       ETCD_INITIAL_CLUSTER: etcd0=http://etcd:2380
       ETCD_INITIAL_CLUSTER_STATE: new
       ETCD_INITIAL_CLUSTER_TOKEN: overmind-etcd
-
       ETCD_LOG_LEVEL: info
     volumes:
       - etcd_data:/etcd-data
-  
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
       interval: 5s
       timeout: 3s
       retries: 10
+
   mysql:
     image: mysql:8.4
     container_name: mysql
@@ -60,12 +53,28 @@ services:
   master:
     <<: *go-service
     command: ["go", "run", "./cmd/master"]
+    environment:
+      MYSQL_DSN: root:172600@tcp(mysql:3306)/DJS?parseTime=true&loc=UTC
+      MASTER_GRPC_ADDR: :50052
+      MASTER_HTTP_ADDR: :8080
+      WORKER_GRPC_ADDR: worker:50051
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
 
   worker:
     <<: *go-service
     command: ["go", "run", "./cmd/worker"]
+    environment:
+      WORKER_GRPC_ADDR: :50051
+      MASTER_GRPC_ADDR: master:50052
+      WORKER_ID: worker-1
+      LOG_DIR: /app/logs
     depends_on:
-      - master
+      master:
+        condition: service_started
 
 volumes:
   etcd_data:
@@ -73,4 +82,3 @@ volumes:
   mysql_data:
   go-mod-cache:
   go-build-cache:
-    

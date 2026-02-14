@@ -4,11 +4,72 @@ package scheduler;
 
 option go_package = "github.com/HITGerhman/distributed-job-scheduler/api/proto;scheduler";
 
+import "google/protobuf/timestamp.proto";
+
 message PingRequest {}
 message PingResponse {
   string message = 1;
 }
 
+enum JobInstanceStatus {
+  JOB_INSTANCE_STATUS_UNSPECIFIED = 0;
+  JOB_INSTANCE_STATUS_PENDING = 1;
+  JOB_INSTANCE_STATUS_RUNNING = 2;
+  JOB_INSTANCE_STATUS_SUCCESS = 3;
+  JOB_INSTANCE_STATUS_FAILED = 4;
+  JOB_INSTANCE_STATUS_KILLED = 5;
+}
+
+message RunJobRequest {
+  int64 job_id = 1;
+  int64 job_instance_id = 2;
+  string command = 3;
+  repeated string args = 4;
+  map<string, string> env = 5;
+  uint32 timeout_seconds = 6;
+  google.protobuf.Timestamp scheduled_at = 7;
+}
+
+message RunJobResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message KillJobRequest {
+  int64 job_instance_id = 1;
+  string reason = 2;
+}
+
+message KillJobResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message ReportResultRequest {
+  int64 job_id = 1;
+  int64 job_instance_id = 2;
+  string worker_id = 3;
+  JobInstanceStatus status = 4;
+  int32 exit_code = 5;
+  string error_message = 6;
+  google.protobuf.Timestamp started_at = 7;
+  google.protobuf.Timestamp finished_at = 8;
+}
+
+message ReportResultResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
 service Scheduler {
   rpc Ping(PingRequest) returns (PingResponse);
+}
+
+service Worker {
+  rpc RunJob(RunJobRequest) returns (RunJobResponse);
+  rpc KillJob(KillJobRequest) returns (KillJobResponse);
+}
+
+service Master {
+  rpc ReportResult(ReportResultRequest) returns (ReportResultResponse);
 }

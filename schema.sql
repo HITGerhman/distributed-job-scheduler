@@ -1,0 +1,40 @@
+CREATE DATABASE IF NOT EXISTS DJS CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+USE DJS;
+
+CREATE TABLE IF NOT EXISTS jobs (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name VARCHAR(128) NOT NULL,
+  cron_expr VARCHAR(128) NOT NULL,
+  command TEXT NOT NULL,
+  args_json JSON NULL,
+  env_json JSON NULL,
+  timeout_seconds INT UNSIGNED NOT NULL DEFAULT 0,
+  enabled TINYINT(1) NOT NULL DEFAULT 1,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_jobs_name (name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS job_instances (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  job_id BIGINT UNSIGNED NOT NULL,
+  scheduled_at DATETIME(3) NOT NULL,
+  status ENUM('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'KILLED') NOT NULL DEFAULT 'PENDING',
+  worker_id VARCHAR(128) NULL,
+  started_at DATETIME(3) NULL,
+  finished_at DATETIME(3) NULL,
+  exit_code INT NULL,
+  error_message TEXT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_job_instances_job_scheduled (job_id, scheduled_at),
+  KEY idx_job_instances_status (status),
+  KEY idx_job_instances_worker_id (worker_id),
+  KEY idx_job_instances_job_id (job_id),
+  CONSTRAINT fk_job_instances_job_id
+    FOREIGN KEY (job_id)
+    REFERENCES jobs(id)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
