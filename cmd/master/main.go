@@ -15,17 +15,32 @@ import (
 	"time"
 
 	scheduler "github.com/HITGerhman/distributed-job-scheduler/api/proto"
-	_ "github.com/go-sql-driver/mysql"
+	mysql "github.com/go-sql-driver/mysql"
+	"github.com/robfig/cron/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+const (
+	manualCronExpr                = "@manual"
+	defaultSchedulerTickInterval  = time.Second
+	defaultSchedulerCatchupWindow = time.Minute
+	defaultSchedulerMaxCatchup    = 10
+)
+
+var defaultCronParser = cron.NewParser(
+	cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor,
+)
+
 type config struct {
-	MySQLDSN       string
-	MasterGRPCAddr string
-	MasterHTTPAddr string
-	WorkerGRPCAddr string
+	MySQLDSN               string
+	MasterGRPCAddr         string
+	MasterHTTPAddr         string
+	WorkerGRPCAddr         string
+	SchedulerTickInterval  time.Duration
+	SchedulerCatchupWindow time.Duration
+	SchedulerMaxCatchup    int
 }
 
 type masterServer struct {
@@ -56,17 +71,49 @@ type triggerJobResponse struct {
 type jobRecord struct {
 	ID             int64
 	Name           string
+	CronExpr       string
 	Command        string
 	Args           []string
 	TimeoutSeconds uint32
+	CreatedAt      time.Time
+}
+
+type jobInstanceRecord struct {
+	ID     int64
+	Status string
+}
+
+type triggerMode struct {
+	Source                     string
+	MarkFailedOnDispatchError  bool
+	AllowExistingPendingReplay bool
 }
 
 func main() {
+	schedulerTickInterval, err := durationEnvOrDefault("SCHEDULER_TICK_INTERVAL", defaultSchedulerTickInterval)
+	if err != nil {
+		log.Fatalf("invalid SCHEDULER_TICK_INTERVAL: %v", err)
+	}
+	schedulerCatchupWindow, err := durationEnvOrDefault("SCHEDULER_CATCHUP_WINDOW", defaultSchedulerCatchupWindow)
+	if err != nil {
+		log.Fatalf("invalid SCHEDULER_CATCHUP_WINDOW: %v", err)
+	}
+	schedulerMaxCatchup, err := intEnvOrDefault("SCHEDULER_MAX_CATCHUP", defaultSchedulerMaxCatchup)
+	if err != nil {
+		log.Fatalf("invalid SCHEDULER_MAX_CATCHUP: %v", err)
+	}
+	if schedulerMaxCatchup <= 0 {
+		log.Fatalf("SCHEDULER_MAX_CATCHUP must be > 0, got %d", schedulerMaxCatchup)
+	}
+
 	cfg := config{
-		MySQLDSN:       envOrDefault("MYSQL_DSN", "root:172600@tcp(mysql:3306)/DJS?parseTime=true&loc=UTC"),
-		MasterGRPCAddr: envOrDefault("MASTER_GRPC_ADDR", ":50052"),
-		MasterHTTPAddr: envOrDefault("MASTER_HTTP_ADDR", ":8080"),
-		WorkerGRPCAddr: envOrDefault("WORKER_GRPC_ADDR", "worker:50051"),
+		MySQLDSN:               envOrDefault("MYSQL_DSN", "root:172600@tcp(mysql:3306)/DJS?parseTime=true&loc=UTC"),
+		MasterGRPCAddr:         envOrDefault("MASTER_GRPC_ADDR", ":50052"),
+		MasterHTTPAddr:         envOrDefault("MASTER_HTTP_ADDR", ":8080"),
+		WorkerGRPCAddr:         envOrDefault("WORKER_GRPC_ADDR", "worker:50051"),
+		SchedulerTickInterval:  schedulerTickInterval,
+		SchedulerCatchupWindow: schedulerCatchupWindow,
+		SchedulerMaxCatchup:    schedulerMaxCatchup,
 	}
 
 	logger := log.New(os.Stdout, "[master] ", log.LstdFlags|log.Lmicroseconds)
@@ -96,7 +143,17 @@ func main() {
 		errCh <- srv.serveHTTP(cfg.MasterHTTPAddr)
 	}()
 
-	logger.Printf("master started: grpc=%s http=%s worker=%s", cfg.MasterGRPCAddr, cfg.MasterHTTPAddr, cfg.WorkerGRPCAddr)
+	go srv.runSchedulerLoop(context.Background())
+
+	logger.Printf(
+		"master started: grpc=%s http=%s worker=%s scheduler_tick=%s catchup_window=%s max_catchup=%d",
+		cfg.MasterGRPCAddr,
+		cfg.MasterHTTPAddr,
+		cfg.WorkerGRPCAddr,
+		cfg.SchedulerTickInterval,
+		cfg.SchedulerCatchupWindow,
+		cfg.SchedulerMaxCatchup,
+	)
 	if err := <-errCh; err != nil {
 		logger.Fatalf("server exited: %v", err)
 	}
@@ -152,13 +209,17 @@ func (s *masterServer) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.Name = strings.TrimSpace(req.Name)
+	req.CronExpr = strings.TrimSpace(req.CronExpr)
 	req.Command = strings.TrimSpace(req.Command)
 	if req.Name == "" || req.Command == "" {
 		http.Error(w, "name and command are required", http.StatusBadRequest)
 		return
 	}
-	if req.CronExpr == "" {
-		req.CronExpr = "@manual"
+	if req.CronExpr == "" || strings.EqualFold(req.CronExpr, manualCronExpr) {
+		req.CronExpr = manualCronExpr
+	} else if _, err := parseCronSchedule(req.CronExpr); err != nil {
+		http.Error(w, fmt.Sprintf("invalid cron_expr: %v", err), http.StatusBadRequest)
+		return
 	}
 	if req.Args == nil {
 		req.Args = []string{}
@@ -226,50 +287,22 @@ func (s *masterServer) handleTriggerJob(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	scheduledAt := time.Now().UTC()
-	res, err := s.db.ExecContext(
+	instance, err := s.triggerJob(
 		r.Context(),
-		`INSERT INTO job_instances(job_id, scheduled_at, status) VALUES (?, ?, 'PENDING')`,
-		job.ID,
-		scheduledAt,
+		job,
+		time.Now().UTC(),
+		triggerMode{
+			Source:                    "manual",
+			MarkFailedOnDispatchError: true,
+		},
 	)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("insert job instance failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	instanceID, err := res.LastInsertId()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("read job instance id failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	runReq := &scheduler.RunJobRequest{
-		JobId:          job.ID,
-		JobInstanceId:  instanceID,
-		Command:        job.Command,
-		Args:           job.Args,
-		TimeoutSeconds: job.TimeoutSeconds,
-		ScheduledAt:    timestamppb.New(scheduledAt),
-	}
-
-	if err := s.dispatchRunJob(r.Context(), runReq); err != nil {
-		_, _ = s.db.ExecContext(
-			r.Context(),
-			`UPDATE job_instances
-			 SET status='FAILED', finished_at=?, error_message=?, updated_at=CURRENT_TIMESTAMP
-			 WHERE id=?`,
-			time.Now().UTC(),
-			"dispatch run job failed: "+err.Error(),
-			instanceID,
-		)
 		http.Error(w, fmt.Sprintf("trigger failed: %v", err), http.StatusBadGateway)
 		return
 	}
 
-	s.logger.Printf("trigger job: job_id=%d instance_id=%d worker=%s", job.ID, instanceID, s.cfg.WorkerGRPCAddr)
 	writeJSON(w, http.StatusOK, triggerJobResponse{
-		JobInstanceID: instanceID,
+		JobInstanceID: instance.ID,
 		Message:       "triggered",
 	})
 }
@@ -350,9 +383,9 @@ func (s *masterServer) loadJob(ctx context.Context, jobID int64) (jobRecord, err
 	job.ID = jobID
 	err := s.db.QueryRowContext(
 		ctx,
-		`SELECT name, command, args_json, timeout_seconds FROM jobs WHERE id=?`,
+		`SELECT name, cron_expr, command, args_json, timeout_seconds, created_at FROM jobs WHERE id=?`,
 		jobID,
-	).Scan(&job.Name, &job.Command, &argsJSON, &job.TimeoutSeconds)
+	).Scan(&job.Name, &job.CronExpr, &job.Command, &argsJSON, &job.TimeoutSeconds, &job.CreatedAt)
 	if err != nil {
 		return jobRecord{}, err
 	}
@@ -363,6 +396,212 @@ func (s *masterServer) loadJob(ctx context.Context, jobID int64) (jobRecord, err
 		}
 	}
 	return job, nil
+}
+
+func (s *masterServer) loadSchedulableJobs(ctx context.Context) ([]jobRecord, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT id, name, cron_expr, command, args_json, timeout_seconds, created_at
+		 FROM jobs
+		 WHERE enabled=1 AND cron_expr<>?
+		 ORDER BY id`,
+		manualCronExpr,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	jobs := make([]jobRecord, 0)
+	for rows.Next() {
+		var (
+			job      jobRecord
+			argsJSON []byte
+		)
+		if err := rows.Scan(&job.ID, &job.Name, &job.CronExpr, &job.Command, &argsJSON, &job.TimeoutSeconds, &job.CreatedAt); err != nil {
+			return nil, err
+		}
+		if len(argsJSON) > 0 {
+			if err := json.Unmarshal(argsJSON, &job.Args); err != nil {
+				return nil, fmt.Errorf("unmarshal args_json for job %d failed: %w", job.ID, err)
+			}
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return jobs, nil
+}
+
+func (s *masterServer) runSchedulerLoop(ctx context.Context) {
+	s.scanAndDispatchDueJobs(ctx, time.Now().UTC())
+
+	ticker := time.NewTicker(s.cfg.SchedulerTickInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case tickAt := <-ticker.C:
+			s.scanAndDispatchDueJobs(ctx, tickAt.UTC())
+		}
+	}
+}
+
+func (s *masterServer) scanAndDispatchDueJobs(ctx context.Context, now time.Time) {
+	jobs, err := s.loadSchedulableJobs(ctx)
+	if err != nil {
+		s.logger.Printf("scheduler load jobs failed: %v", err)
+		return
+	}
+	if len(jobs) == 0 {
+		return
+	}
+
+	windowStart := now.UTC().Add(-s.cfg.SchedulerCatchupWindow)
+	mode := triggerMode{
+		Source:                     "scheduler",
+		AllowExistingPendingReplay: true,
+	}
+
+	for _, job := range jobs {
+		schedule, err := parseCronSchedule(job.CronExpr)
+		if err != nil {
+			s.logger.Printf("scheduler skip job: job_id=%d invalid cron_expr=%q err=%v", job.ID, job.CronExpr, err)
+			continue
+		}
+
+		jobWindowStart := windowStart
+		if job.CreatedAt.UTC().After(jobWindowStart) {
+			jobWindowStart = job.CreatedAt.UTC()
+		}
+
+		slots, _ := scheduledSlotsWithinWindow(schedule, jobWindowStart, now.UTC(), s.cfg.SchedulerMaxCatchup)
+		for _, slot := range slots {
+			instance, err := s.triggerJob(ctx, job, slot, mode)
+			if err != nil {
+				s.logger.Printf(
+					"scheduler trigger failed: job_id=%d instance_id=%d slot=%s err=%v",
+					job.ID,
+					instance.ID,
+					slot.Format(time.RFC3339Nano),
+					err,
+				)
+			}
+		}
+	}
+}
+
+func (s *masterServer) triggerJob(
+	ctx context.Context,
+	job jobRecord,
+	scheduledAt time.Time,
+	mode triggerMode,
+) (jobInstanceRecord, error) {
+	normalizedScheduledAt := normalizeScheduledAt(scheduledAt)
+
+	instance, created, err := s.ensureJobInstance(ctx, job.ID, normalizedScheduledAt)
+	if err != nil {
+		return jobInstanceRecord{}, err
+	}
+
+	if !created {
+		switch instance.Status {
+		case "PENDING":
+			if !mode.AllowExistingPendingReplay {
+				return instance, nil
+			}
+		default:
+			return instance, nil
+		}
+	}
+
+	runReq := &scheduler.RunJobRequest{
+		JobId:          job.ID,
+		JobInstanceId:  instance.ID,
+		Command:        job.Command,
+		Args:           job.Args,
+		TimeoutSeconds: job.TimeoutSeconds,
+		ScheduledAt:    timestamppb.New(normalizedScheduledAt),
+	}
+
+	if err := s.dispatchRunJob(ctx, runReq); err != nil {
+		if mode.MarkFailedOnDispatchError {
+			s.markDispatchFailed(ctx, instance.ID, err)
+		}
+		return instance, err
+	}
+
+	action := "trigger job"
+	if !created {
+		action = "redispatch pending job"
+	}
+	s.logger.Printf(
+		"%s: source=%s job_id=%d instance_id=%d scheduled_at=%s worker=%s",
+		action,
+		mode.Source,
+		job.ID,
+		instance.ID,
+		normalizedScheduledAt.Format(time.RFC3339Nano),
+		s.cfg.WorkerGRPCAddr,
+	)
+	return instance, nil
+}
+
+func (s *masterServer) ensureJobInstance(ctx context.Context, jobID int64, scheduledAt time.Time) (jobInstanceRecord, bool, error) {
+	res, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO job_instances(job_id, scheduled_at, status) VALUES (?, ?, 'PENDING')`,
+		jobID,
+		scheduledAt,
+	)
+	if err == nil {
+		instanceID, readErr := res.LastInsertId()
+		if readErr != nil {
+			return jobInstanceRecord{}, false, fmt.Errorf("read job instance id failed: %w", readErr)
+		}
+		return jobInstanceRecord{ID: instanceID, Status: "PENDING"}, true, nil
+	}
+	if !isDuplicateKeyError(err) {
+		return jobInstanceRecord{}, false, fmt.Errorf("insert job instance failed: %w", err)
+	}
+
+	instance, loadErr := s.getJobInstanceBySlot(ctx, jobID, scheduledAt)
+	if loadErr != nil {
+		return jobInstanceRecord{}, false, fmt.Errorf("load existing job instance failed: %w", loadErr)
+	}
+	return instance, false, nil
+}
+
+func (s *masterServer) getJobInstanceBySlot(ctx context.Context, jobID int64, scheduledAt time.Time) (jobInstanceRecord, error) {
+	var instance jobInstanceRecord
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id, status FROM job_instances WHERE job_id=? AND scheduled_at=?`,
+		jobID,
+		scheduledAt,
+	).Scan(&instance.ID, &instance.Status)
+	if err != nil {
+		return jobInstanceRecord{}, err
+	}
+	return instance, nil
+}
+
+func (s *masterServer) markDispatchFailed(ctx context.Context, instanceID int64, dispatchErr error) {
+	_, err := s.db.ExecContext(
+		ctx,
+		`UPDATE job_instances
+		 SET status='FAILED', finished_at=?, error_message=?, updated_at=CURRENT_TIMESTAMP
+		 WHERE id=? AND status='PENDING'`,
+		time.Now().UTC(),
+		"dispatch run job failed: "+dispatchErr.Error(),
+		instanceID,
+	)
+	if err != nil {
+		s.logger.Printf("mark dispatch failed: instance_id=%d err=%v", instanceID, err)
+	}
 }
 
 func (s *masterServer) dispatchRunJob(parent context.Context, req *scheduler.RunJobRequest) error {
@@ -491,11 +730,66 @@ func optionalTime(ts *timestamppb.Timestamp) interface{} {
 	return t.UTC()
 }
 
+func parseCronSchedule(expr string) (cron.Schedule, error) {
+	return defaultCronParser.Parse(strings.TrimSpace(expr))
+}
+
+func scheduledSlotsWithinWindow(schedule cron.Schedule, windowStart, now time.Time, maxCatchup int) ([]time.Time, int) {
+	if maxCatchup <= 0 || now.Before(windowStart) {
+		return nil, 0
+	}
+
+	cursor := windowStart.Add(-time.Nanosecond)
+	slots := make([]time.Time, 0, maxCatchup)
+	skipped := 0
+
+	for {
+		next := schedule.Next(cursor)
+		if next.After(now) {
+			break
+		}
+
+		slots = append(slots, normalizeScheduledAt(next))
+		if len(slots) > maxCatchup {
+			slots = slots[1:]
+			skipped++
+		}
+		cursor = next
+	}
+
+	return slots, skipped
+}
+
+func normalizeScheduledAt(t time.Time) time.Time {
+	return t.UTC().Truncate(time.Millisecond)
+}
+
+func isDuplicateKeyError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1062
+}
+
 func envOrDefault(key, defaultValue string) string {
 	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 		return value
 	}
 	return defaultValue
+}
+
+func durationEnvOrDefault(key string, defaultValue time.Duration) (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue, nil
+	}
+	return time.ParseDuration(value)
+}
+
+func intEnvOrDefault(key string, defaultValue int) (int, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue, nil
+	}
+	return strconv.Atoi(value)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
