@@ -7,6 +7,25 @@ x-go-service: &go-service
     - go-build-cache:/root/.cache/go-build
   restart: unless-stopped
 
+x-master-service: &master-service
+  <<: *go-service
+  command: ["go", "run", "./cmd/master"]
+  environment:
+    MYSQL_DSN: root:172600@tcp(mysql:3306)/DJS?parseTime=true&loc=UTC
+    MASTER_GRPC_ADDR: :50052
+    MASTER_HTTP_ADDR: :8080
+    WORKER_GRPC_ADDR: worker:50051
+    ETCD_ENDPOINTS: http://etcd:2379
+    ETCD_DIAL_TIMEOUT: 5s
+    WORKER_DISCOVERY_PREFIX: /workers/
+    LEADER_ELECTION_KEY: /masters/leader
+    MASTER_LEASE_TTL: 5
+  depends_on:
+    mysql:
+      condition: service_healthy
+    etcd:
+      condition: service_healthy
+
 services:
   etcd:
     image: quay.io/coreos/etcd:v3.5.11
@@ -50,24 +69,59 @@ services:
       timeout: 3s
       retries: 20
 
-  master:
-    <<: *go-service
-    command: ["go", "run", "./cmd/master"]
+  master-1:
+    <<: *master-service
     environment:
       MYSQL_DSN: root:172600@tcp(mysql:3306)/DJS?parseTime=true&loc=UTC
+      MASTER_ID: master-1
       MASTER_GRPC_ADDR: :50052
       MASTER_HTTP_ADDR: :8080
+      MASTER_ADVERTISE_GRPC_ADDR: master-1:50052
+      MASTER_ADVERTISE_HTTP_ADDR: master-1:8080
       WORKER_GRPC_ADDR: worker:50051
       ETCD_ENDPOINTS: http://etcd:2379
       ETCD_DIAL_TIMEOUT: 5s
       WORKER_DISCOVERY_PREFIX: /workers/
+      LEADER_ELECTION_KEY: /masters/leader
+      MASTER_LEASE_TTL: 5
     ports:
       - "8080:8080"
-    depends_on:
-      mysql:
-        condition: service_healthy
-      etcd:
-        condition: service_healthy
+
+  master-2:
+    <<: *master-service
+    environment:
+      MYSQL_DSN: root:172600@tcp(mysql:3306)/DJS?parseTime=true&loc=UTC
+      MASTER_ID: master-2
+      MASTER_GRPC_ADDR: :50052
+      MASTER_HTTP_ADDR: :8080
+      MASTER_ADVERTISE_GRPC_ADDR: master-2:50052
+      MASTER_ADVERTISE_HTTP_ADDR: master-2:8080
+      WORKER_GRPC_ADDR: worker:50051
+      ETCD_ENDPOINTS: http://etcd:2379
+      ETCD_DIAL_TIMEOUT: 5s
+      WORKER_DISCOVERY_PREFIX: /workers/
+      LEADER_ELECTION_KEY: /masters/leader
+      MASTER_LEASE_TTL: 5
+    ports:
+      - "8081:8080"
+
+  master-3:
+    <<: *master-service
+    environment:
+      MYSQL_DSN: root:172600@tcp(mysql:3306)/DJS?parseTime=true&loc=UTC
+      MASTER_ID: master-3
+      MASTER_GRPC_ADDR: :50052
+      MASTER_HTTP_ADDR: :8080
+      MASTER_ADVERTISE_GRPC_ADDR: master-3:50052
+      MASTER_ADVERTISE_HTTP_ADDR: master-3:8080
+      WORKER_GRPC_ADDR: worker:50051
+      ETCD_ENDPOINTS: http://etcd:2379
+      ETCD_DIAL_TIMEOUT: 5s
+      WORKER_DISCOVERY_PREFIX: /workers/
+      LEADER_ELECTION_KEY: /masters/leader
+      MASTER_LEASE_TTL: 5
+    ports:
+      - "8082:8080"
 
   worker:
     <<: *go-service
@@ -75,17 +129,23 @@ services:
     environment:
       WORKER_GRPC_ADDR: :50051
       WORKER_ADVERTISE_ADDR: worker:50051
-      MASTER_GRPC_ADDR: master:50052
+      MASTER_GRPC_ADDRS: master-1:50052,master-2:50052,master-3:50052
       WORKER_ID: worker-1
       LOG_DIR: /app/logs
       ETCD_ENDPOINTS: http://etcd:2379
       ETCD_DIAL_TIMEOUT: 5s
       WORKER_DISCOVERY_PREFIX: /workers/
       WORKER_LEASE_TTL: 10
+      LEADER_ELECTION_KEY: /masters/leader
+      MASTER_REPORT_TIMEOUT: 12s
     depends_on:
       etcd:
         condition: service_healthy
-      master:
+      master-1:
+        condition: service_started
+      master-2:
+        condition: service_started
+      master-3:
         condition: service_started
 
 volumes:

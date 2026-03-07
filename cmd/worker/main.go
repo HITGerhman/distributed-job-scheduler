@@ -17,22 +17,27 @@ import (
 
 	scheduler "github.com/HITGerhman/distributed-job-scheduler/api/proto"
 	"github.com/HITGerhman/distributed-job-scheduler/internal/discovery"
+	"github.com/HITGerhman/distributed-job-scheduler/internal/election"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+const defaultMasterReportTimeout = 12 * time.Second
+
 type config struct {
 	WorkerGRPCAddr        string
 	WorkerAdvertiseAddr   string
-	MasterGRPCAddr        string
+	MasterGRPCAddrs       []string
 	WorkerID              string
 	LogDir                string
 	EtcdEndpoints         []string
 	EtcdDialTimeout       time.Duration
 	WorkerDiscoveryPrefix string
 	WorkerLeaseTTL        int64
+	LeaderElectionKey     string
+	MasterReportTimeout   time.Duration
 }
 
 type workerServer struct {
@@ -49,6 +54,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid ETCD_DIAL_TIMEOUT: %v", err)
 	}
+	masterReportTimeout, err := durationEnvOrDefault("MASTER_REPORT_TIMEOUT", defaultMasterReportTimeout)
+	if err != nil {
+		log.Fatalf("invalid MASTER_REPORT_TIMEOUT: %v", err)
+	}
+	if masterReportTimeout <= 0 {
+		log.Fatalf("MASTER_REPORT_TIMEOUT must be > 0, got %s", masterReportTimeout)
+	}
 	workerLeaseTTL, err := int64EnvOrDefault("WORKER_LEASE_TTL", discovery.DefaultLeaseTTLSeconds)
 	if err != nil {
 		log.Fatalf("invalid WORKER_LEASE_TTL: %v", err)
@@ -60,13 +72,15 @@ func main() {
 	cfg := config{
 		WorkerGRPCAddr:        envOrDefault("WORKER_GRPC_ADDR", ":50051"),
 		WorkerAdvertiseAddr:   envOrDefault("WORKER_ADVERTISE_ADDR", envOrDefault("WORKER_GRPC_ADDR", ":50051")),
-		MasterGRPCAddr:        envOrDefault("MASTER_GRPC_ADDR", "master:50052"),
+		MasterGRPCAddrs:       parseMasterGRPCAddrs(envOrDefault("MASTER_GRPC_ADDRS", envOrDefault("MASTER_GRPC_ADDR", "master:50052"))),
 		WorkerID:              envOrDefault("WORKER_ID", "worker-1"),
 		LogDir:                envOrDefault("LOG_DIR", "/app/logs"),
 		EtcdEndpoints:         discovery.ParseEtcdEndpoints(envOrDefault("ETCD_ENDPOINTS", discovery.DefaultEtcdEndpointsRaw)),
 		EtcdDialTimeout:       etcdDialTimeout,
 		WorkerDiscoveryPrefix: discovery.NormalizeWorkerPrefix(envOrDefault("WORKER_DISCOVERY_PREFIX", discovery.DefaultWorkerPrefix)),
 		WorkerLeaseTTL:        workerLeaseTTL,
+		LeaderElectionKey:     election.NormalizeLeaderKey(envOrDefault("LEADER_ELECTION_KEY", election.DefaultLeaderKey)),
+		MasterReportTimeout:   masterReportTimeout,
 	}
 	if len(cfg.EtcdEndpoints) == 0 {
 		log.Fatalf("no ETCD_ENDPOINTS configured")
@@ -104,12 +118,14 @@ func main() {
 	go srv.runRegistrationLoop(context.Background())
 
 	logger.Printf(
-		"worker started: grpc=%s advertise=%s master=%s etcd=%v lease_ttl=%d",
+		"worker started: grpc=%s advertise=%s masters=%v etcd=%v leader_key=%s lease_ttl=%d report_timeout=%s",
 		cfg.WorkerGRPCAddr,
 		cfg.WorkerAdvertiseAddr,
-		cfg.MasterGRPCAddr,
+		cfg.MasterGRPCAddrs,
 		cfg.EtcdEndpoints,
+		cfg.LeaderElectionKey,
 		cfg.WorkerLeaseTTL,
+		cfg.MasterReportTimeout,
 	)
 	if err := grpcServer.Serve(lis); err != nil {
 		logger.Fatalf("worker grpc serve failed: %v", err)
@@ -334,32 +350,134 @@ func (s *workerServer) reportResult(
 		report.FinishedAt = timestamppb.New(finishedAt)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	deadline := time.Now().Add(s.cfg.MasterReportTimeout)
+	attempt := 0
+	var lastErr error
+
+	for {
+		attempt++
+
+		targets, err := s.resolveMasterReportTargets()
+		if err != nil {
+			lastErr = err
+		} else {
+			for _, target := range targets {
+				if err := s.sendResultReport(target, report); err == nil {
+					s.logger.Printf(
+						"report success: instance_id=%d status=%s target=%s attempt=%d",
+						req.GetJobInstanceId(),
+						status.String(),
+						target,
+						attempt,
+					)
+					return
+				} else {
+					lastErr = err
+				}
+			}
+		}
+
+		if time.Now().After(deadline) {
+			break
+		}
+
+		s.logger.Printf(
+			"report retry: instance_id=%d status=%s attempt=%d err=%v",
+			req.GetJobInstanceId(),
+			status.String(),
+			attempt,
+			lastErr,
+		)
+
+		sleepFor := time.Second
+		if remaining := time.Until(deadline); remaining < sleepFor {
+			sleepFor = remaining
+		}
+		if sleepFor <= 0 {
+			break
+		}
+		time.Sleep(sleepFor)
+	}
+
+	s.logger.Printf(
+		"report failed permanently: instance_id=%d status=%s err=%v",
+		req.GetJobInstanceId(),
+		status.String(),
+		lastErr,
+	)
+}
+
+func (s *workerServer) resolveMasterReportTargets() ([]string, error) {
+	seen := make(map[string]struct{}, len(s.cfg.MasterGRPCAddrs)+1)
+	targets := make([]string, 0, len(s.cfg.MasterGRPCAddrs)+1)
+
+	if leaderAddr, err := s.lookupLeaderGRPCAddr(); err == nil && leaderAddr != "" {
+		seen[leaderAddr] = struct{}{}
+		targets = append(targets, leaderAddr)
+	} else if err != nil {
+		s.logger.Printf("lookup leader for report failed: err=%v", err)
+	}
+
+	for _, addr := range s.cfg.MasterGRPCAddrs {
+		if _, ok := seen[addr]; ok {
+			continue
+		}
+		seen[addr] = struct{}{}
+		targets = append(targets, addr)
+	}
+
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("no master grpc targets available")
+	}
+	return targets, nil
+}
+
+func (s *workerServer) lookupLeaderGRPCAddr() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resp, err := s.etcd.Get(ctx, s.cfg.LeaderElectionKey)
+	if err != nil {
+		return "", fmt.Errorf("load leader key failed: %w", err)
+	}
+	if len(resp.Kvs) == 0 {
+		return "", fmt.Errorf("leader key %s not found", s.cfg.LeaderElectionKey)
+	}
+
+	record, err := election.DecodeLeaderRecord(resp.Kvs[0].Value)
+	if err != nil {
+		return "", fmt.Errorf("decode leader record failed: %w", err)
+	}
+	if strings.TrimSpace(record.GRPCAdvertiseAddr) == "" {
+		return "", fmt.Errorf("leader record missing grpc addr")
+	}
+	return record.GRPCAdvertiseAddr, nil
+}
+
+func (s *workerServer) sendResultReport(target string, report *scheduler.ReportResultRequest) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
 	conn, err := grpc.DialContext(
 		ctx,
-		s.cfg.MasterGRPCAddr,
+		target,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
 	)
 	if err != nil {
-		s.logger.Printf("report dial master failed: instance_id=%d status=%s err=%v", req.GetJobInstanceId(), status.String(), err)
-		return
+		return fmt.Errorf("dial master %s failed: %w", target, err)
 	}
 	defer conn.Close()
 
 	client := scheduler.NewMasterClient(conn)
 	resp, err := client.ReportResult(ctx, report)
 	if err != nil {
-		s.logger.Printf("report result failed: instance_id=%d status=%s err=%v", req.GetJobInstanceId(), status.String(), err)
-		return
+		return fmt.Errorf("report result to %s failed: %w", target, err)
 	}
 	if !resp.GetAccepted() {
-		s.logger.Printf("report rejected: instance_id=%d status=%s msg=%s", req.GetJobInstanceId(), status.String(), resp.GetMessage())
-		return
+		return fmt.Errorf("report to %s rejected: %s", target, resp.GetMessage())
 	}
-	s.logger.Printf("report success: instance_id=%d status=%s", req.GetJobInstanceId(), status.String())
+	return nil
 }
 
 func flattenEnv(env map[string]string) []string {
@@ -394,4 +512,17 @@ func int64EnvOrDefault(key string, defaultValue int64) (int64, error) {
 		return defaultValue, nil
 	}
 	return strconv.ParseInt(value, 10, 64)
+}
+
+func parseMasterGRPCAddrs(raw string) []string {
+	parts := strings.Split(raw, ",")
+	addrs := make([]string, 0, len(parts))
+	for _, part := range parts {
+		addr := strings.TrimSpace(part)
+		if addr == "" {
+			continue
+		}
+		addrs = append(addrs, addr)
+	}
+	return addrs
 }

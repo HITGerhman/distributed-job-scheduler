@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/HITGerhman/distributed-job-scheduler/internal/discovery"
+	"github.com/HITGerhman/distributed-job-scheduler/internal/election"
 )
 
 func TestParseCronScheduleWithSeconds(t *testing.T) {
@@ -116,5 +117,38 @@ func TestSelectWorkerRoundRobin(t *testing.T) {
 
 	if first.ID != "worker-a" || second.ID != "worker-b" || third.ID != "worker-a" {
 		t.Fatalf("round robin order = [%s %s %s]", first.ID, second.ID, third.ID)
+	}
+}
+
+func TestShouldScheduleRequiresLeader(t *testing.T) {
+	t.Parallel()
+
+	srv := &masterServer{cfg: config{MasterID: "master-1"}}
+	if srv.shouldSchedule() {
+		t.Fatalf("shouldSchedule() = true before leader election")
+	}
+
+	srv.setLeaderState(true, election.LeaderRecord{MasterID: "master-1"})
+	if !srv.shouldSchedule() {
+		t.Fatalf("shouldSchedule() = false for leader")
+	}
+
+	srv.setLeaderState(false, election.LeaderRecord{MasterID: "master-2"})
+	if srv.shouldSchedule() {
+		t.Fatalf("shouldSchedule() = true for follower")
+	}
+}
+
+func TestDefaultAdvertiseAddr(t *testing.T) {
+	t.Parallel()
+
+	if got := defaultAdvertiseAddr(":50052", "master-1"); got != "master-1:50052" {
+		t.Fatalf("defaultAdvertiseAddr(:50052) = %q, want %q", got, "master-1:50052")
+	}
+	if got := defaultAdvertiseAddr("0.0.0.0:8080", "master-2"); got != "master-2:8080" {
+		t.Fatalf("defaultAdvertiseAddr(0.0.0.0:8080) = %q, want %q", got, "master-2:8080")
+	}
+	if got := defaultAdvertiseAddr("master-3:8080", "master-x"); got != "master-3:8080" {
+		t.Fatalf("defaultAdvertiseAddr(master-3:8080) = %q, want %q", got, "master-3:8080")
 	}
 }

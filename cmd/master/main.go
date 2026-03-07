@@ -18,6 +18,7 @@ import (
 
 	scheduler "github.com/HITGerhman/distributed-job-scheduler/api/proto"
 	"github.com/HITGerhman/distributed-job-scheduler/internal/discovery"
+	"github.com/HITGerhman/distributed-job-scheduler/internal/election"
 	mysql "github.com/go-sql-driver/mysql"
 	"github.com/robfig/cron/v3"
 	"go.etcd.io/etcd/api/v3/mvccpb"
@@ -39,16 +40,21 @@ var defaultCronParser = cron.NewParser(
 )
 
 type config struct {
-	MySQLDSN               string
-	MasterGRPCAddr         string
-	MasterHTTPAddr         string
-	WorkerGRPCAddr         string
-	EtcdEndpoints          []string
-	EtcdDialTimeout        time.Duration
-	WorkerDiscoveryPrefix  string
-	SchedulerTickInterval  time.Duration
-	SchedulerCatchupWindow time.Duration
-	SchedulerMaxCatchup    int
+	MySQLDSN                string
+	MasterID                string
+	MasterGRPCAddr          string
+	MasterHTTPAddr          string
+	MasterAdvertiseGRPCAddr string
+	MasterAdvertiseHTTPAddr string
+	WorkerGRPCAddr          string
+	EtcdEndpoints           []string
+	EtcdDialTimeout         time.Duration
+	WorkerDiscoveryPrefix   string
+	LeaderElectionKey       string
+	MasterLeaseTTL          int64
+	SchedulerTickInterval   time.Duration
+	SchedulerCatchupWindow  time.Duration
+	SchedulerMaxCatchup     int
 }
 
 type masterServer struct {
@@ -61,6 +67,9 @@ type masterServer struct {
 	workers         map[string]discovery.WorkerRegistration
 	workerOrder     []string
 	nextWorkerIndex int
+	leaderMu        sync.RWMutex
+	isLeader        bool
+	leaderRecord    election.LeaderRecord
 }
 
 type createJobRequest struct {
@@ -103,9 +112,24 @@ type triggerMode struct {
 }
 
 func main() {
+	masterID := strings.TrimSpace(os.Getenv("MASTER_ID"))
+	if masterID == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			log.Fatalf("read hostname failed: %v", err)
+		}
+		masterID = hostname
+	}
 	etcdDialTimeout, err := durationEnvOrDefault("ETCD_DIAL_TIMEOUT", discovery.DefaultEtcdDialTimeout)
 	if err != nil {
 		log.Fatalf("invalid ETCD_DIAL_TIMEOUT: %v", err)
+	}
+	masterLeaseTTL, err := int64EnvOrDefault("MASTER_LEASE_TTL", election.DefaultMasterLeaseTTLSeconds)
+	if err != nil {
+		log.Fatalf("invalid MASTER_LEASE_TTL: %v", err)
+	}
+	if masterLeaseTTL <= 0 {
+		log.Fatalf("MASTER_LEASE_TTL must be > 0, got %d", masterLeaseTTL)
 	}
 	schedulerTickInterval, err := durationEnvOrDefault("SCHEDULER_TICK_INTERVAL", defaultSchedulerTickInterval)
 	if err != nil {
@@ -125,16 +149,21 @@ func main() {
 
 	cfg := config{
 		MySQLDSN:               envOrDefault("MYSQL_DSN", "root:172600@tcp(mysql:3306)/DJS?parseTime=true&loc=UTC"),
+		MasterID:               masterID,
 		MasterGRPCAddr:         envOrDefault("MASTER_GRPC_ADDR", ":50052"),
 		MasterHTTPAddr:         envOrDefault("MASTER_HTTP_ADDR", ":8080"),
 		WorkerGRPCAddr:         envOrDefault("WORKER_GRPC_ADDR", "worker:50051"),
 		EtcdEndpoints:          discovery.ParseEtcdEndpoints(envOrDefault("ETCD_ENDPOINTS", discovery.DefaultEtcdEndpointsRaw)),
 		EtcdDialTimeout:        etcdDialTimeout,
 		WorkerDiscoveryPrefix:  discovery.NormalizeWorkerPrefix(envOrDefault("WORKER_DISCOVERY_PREFIX", discovery.DefaultWorkerPrefix)),
+		LeaderElectionKey:      election.NormalizeLeaderKey(envOrDefault("LEADER_ELECTION_KEY", election.DefaultLeaderKey)),
+		MasterLeaseTTL:         masterLeaseTTL,
 		SchedulerTickInterval:  schedulerTickInterval,
 		SchedulerCatchupWindow: schedulerCatchupWindow,
 		SchedulerMaxCatchup:    schedulerMaxCatchup,
 	}
+	cfg.MasterAdvertiseGRPCAddr = envOrDefault("MASTER_ADVERTISE_GRPC_ADDR", defaultAdvertiseAddr(cfg.MasterGRPCAddr, cfg.MasterID))
+	cfg.MasterAdvertiseHTTPAddr = envOrDefault("MASTER_ADVERTISE_HTTP_ADDR", defaultAdvertiseAddr(cfg.MasterHTTPAddr, cfg.MasterID))
 	if len(cfg.EtcdEndpoints) == 0 {
 		log.Fatalf("no ETCD_ENDPOINTS configured")
 	}
@@ -182,14 +211,20 @@ func main() {
 	}()
 
 	go srv.runWorkerWatchLoop(context.Background())
+	go srv.runLeaderElectionLoop(context.Background())
 	go srv.runSchedulerLoop(context.Background())
 
 	logger.Printf(
-		"master started: grpc=%s http=%s worker_fallback=%s etcd=%v scheduler_tick=%s catchup_window=%s max_catchup=%d",
+		"master started: id=%s grpc=%s advertise_grpc=%s http=%s advertise_http=%s worker_fallback=%s etcd=%v leader_key=%s lease_ttl=%d scheduler_tick=%s catchup_window=%s max_catchup=%d",
+		cfg.MasterID,
 		cfg.MasterGRPCAddr,
+		cfg.MasterAdvertiseGRPCAddr,
 		cfg.MasterHTTPAddr,
+		cfg.MasterAdvertiseHTTPAddr,
 		cfg.WorkerGRPCAddr,
 		cfg.EtcdEndpoints,
+		cfg.LeaderElectionKey,
+		cfg.MasterLeaseTTL,
 		cfg.SchedulerTickInterval,
 		cfg.SchedulerCatchupWindow,
 		cfg.SchedulerMaxCatchup,
@@ -229,10 +264,29 @@ func (s *masterServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":  "ok",
-		"workers": s.workerCount(),
-	})
+	isLeader, leader := s.leaderSnapshot()
+	role := "follower"
+	if isLeader {
+		role = "leader"
+	}
+
+	resp := map[string]interface{}{
+		"status":    "ok",
+		"master_id": s.cfg.MasterID,
+		"role":      role,
+		"is_leader": isLeader,
+		"workers":   s.workerCount(),
+	}
+	if leader.MasterID != "" {
+		resp["leader_id"] = leader.MasterID
+	}
+	if leader.HTTPAdvertiseAddr != "" {
+		resp["leader_http_addr"] = leader.HTTPAdvertiseAddr
+	}
+	if leader.GRPCAdvertiseAddr != "" {
+		resp["leader_grpc_addr"] = leader.GRPCAdvertiseAddr
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *masterServer) handleCreateJob(w http.ResponseWriter, r *http.Request) {
@@ -494,6 +548,10 @@ func (s *masterServer) runSchedulerLoop(ctx context.Context) {
 }
 
 func (s *masterServer) scanAndDispatchDueJobs(ctx context.Context, now time.Time) {
+	if !s.shouldSchedule() {
+		return
+	}
+
 	jobs, err := s.loadSchedulableJobs(ctx)
 	if err != nil {
 		s.logger.Printf("scheduler load jobs failed: %v", err)
@@ -647,6 +705,206 @@ func (s *masterServer) markDispatchFailed(ctx context.Context, instanceID int64,
 	if err != nil {
 		s.logger.Printf("mark dispatch failed: instance_id=%d err=%v", instanceID, err)
 	}
+}
+
+func (s *masterServer) runLeaderElectionLoop(ctx context.Context) {
+	for {
+		err := s.campaignForLeader(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			s.logger.Printf("leader election loop error: %v", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (s *masterServer) campaignForLeader(ctx context.Context) error {
+	record := election.LeaderRecord{
+		MasterID:          s.cfg.MasterID,
+		HTTPAdvertiseAddr: s.cfg.MasterAdvertiseHTTPAddr,
+		GRPCAdvertiseAddr: s.cfg.MasterAdvertiseGRPCAddr,
+		ElectedAt:         time.Now().UTC(),
+	}
+	value, err := election.EncodeLeaderRecord(record)
+	if err != nil {
+		return fmt.Errorf("encode leader record failed: %w", err)
+	}
+
+	leaseCtx, cancelLease := context.WithTimeout(ctx, 5*time.Second)
+	leaseResp, err := s.etcd.Grant(leaseCtx, s.cfg.MasterLeaseTTL)
+	cancelLease()
+	if err != nil {
+		return fmt.Errorf("grant leader lease failed: %w", err)
+	}
+
+	txnCtx, cancelTxn := context.WithTimeout(ctx, 5*time.Second)
+	txnResp, err := s.etcd.Txn(txnCtx).
+		If(clientv3.Compare(clientv3.CreateRevision(s.cfg.LeaderElectionKey), "=", 0)).
+		Then(clientv3.OpPut(s.cfg.LeaderElectionKey, string(value), clientv3.WithLease(leaseResp.ID))).
+		Else(clientv3.OpGet(s.cfg.LeaderElectionKey)).
+		Commit()
+	cancelTxn()
+	if err != nil {
+		s.revokeLeaderLease(leaseResp.ID)
+		return fmt.Errorf("campaign leader failed: %w", err)
+	}
+
+	if txnResp.Succeeded {
+		s.setLeaderState(true, record)
+
+		keepAliveCtx, cancelKeepAlive := context.WithCancel(ctx)
+		defer cancelKeepAlive()
+
+		keepAliveCh, err := s.etcd.KeepAlive(keepAliveCtx, leaseResp.ID)
+		if err != nil {
+			s.setLeaderState(false, election.LeaderRecord{})
+			s.revokeLeaderLease(leaseResp.ID)
+			return fmt.Errorf("leader keepalive failed: %w", err)
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				s.revokeLeaderLease(leaseResp.ID)
+				s.setLeaderState(false, election.LeaderRecord{})
+				return ctx.Err()
+			case resp, ok := <-keepAliveCh:
+				if !ok || resp == nil {
+					s.setLeaderState(false, election.LeaderRecord{})
+					return fmt.Errorf("leader keepalive channel closed")
+				}
+			}
+		}
+	}
+
+	s.revokeLeaderLease(leaseResp.ID)
+
+	leader, watchRevision := leaderFromTxnResponse(txnResp)
+	s.setLeaderState(false, leader)
+	if leader.MasterID == "" {
+		return nil
+	}
+	return s.waitForLeaderChange(ctx, watchRevision)
+}
+
+func leaderFromTxnResponse(resp *clientv3.TxnResponse) (election.LeaderRecord, int64) {
+	if resp == nil {
+		return election.LeaderRecord{}, 0
+	}
+
+	for _, opResp := range resp.Responses {
+		rangeResp := opResp.GetResponseRange()
+		if rangeResp == nil || len(rangeResp.Kvs) == 0 {
+			continue
+		}
+
+		record, err := election.DecodeLeaderRecord(rangeResp.Kvs[0].Value)
+		if err != nil {
+			return election.LeaderRecord{}, resp.Header.Revision
+		}
+		return record, resp.Header.Revision
+	}
+
+	return election.LeaderRecord{}, resp.Header.Revision
+}
+
+func (s *masterServer) waitForLeaderChange(ctx context.Context, fromRevision int64) error {
+	revision := fromRevision + 1
+	if revision <= 0 {
+		revision = 1
+	}
+
+	watchCh := s.etcd.Watch(ctx, s.cfg.LeaderElectionKey, clientv3.WithRev(revision))
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case watchResp, ok := <-watchCh:
+			if !ok {
+				return fmt.Errorf("leader watch channel closed")
+			}
+			if err := watchResp.Err(); err != nil {
+				return fmt.Errorf("leader watch failed: %w", err)
+			}
+
+			for _, event := range watchResp.Events {
+				switch event.Type {
+				case mvccpb.PUT:
+					record, err := election.DecodeLeaderRecord(event.Kv.Value)
+					if err != nil {
+						s.logger.Printf("skip invalid leader record: key=%s err=%v", string(event.Kv.Key), err)
+						continue
+					}
+					s.setLeaderState(false, record)
+				case mvccpb.DELETE:
+					s.setLeaderState(false, election.LeaderRecord{})
+					return nil
+				}
+			}
+		}
+	}
+}
+
+func (s *masterServer) revokeLeaderLease(leaseID clientv3.LeaseID) {
+	if leaseID == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if _, err := s.etcd.Revoke(ctx, leaseID); err != nil {
+		s.logger.Printf("revoke leader lease failed: lease_id=%d err=%v", leaseID, err)
+	}
+}
+
+func (s *masterServer) setLeaderState(isLeader bool, leader election.LeaderRecord) {
+	s.leaderMu.Lock()
+	prevIsLeader := s.isLeader
+	prevLeader := s.leaderRecord
+
+	s.isLeader = isLeader
+	s.leaderRecord = leader
+	s.leaderMu.Unlock()
+
+	if s.logger == nil {
+		return
+	}
+
+	switch {
+	case isLeader && (!prevIsLeader || prevLeader.MasterID != leader.MasterID):
+		s.logger.Printf("leader acquired: master_id=%s key=%s", s.cfg.MasterID, s.cfg.LeaderElectionKey)
+	case !isLeader && prevIsLeader:
+		if leader.MasterID != "" {
+			s.logger.Printf("leader lost: master_id=%s new_leader=%s", s.cfg.MasterID, leader.MasterID)
+		} else {
+			s.logger.Printf("leader lost: master_id=%s", s.cfg.MasterID)
+		}
+	case !isLeader && prevLeader.MasterID != leader.MasterID && leader.MasterID != "":
+		s.logger.Printf(
+			"leader observed: leader_id=%s http=%s grpc=%s",
+			leader.MasterID,
+			leader.HTTPAdvertiseAddr,
+			leader.GRPCAdvertiseAddr,
+		)
+	case !isLeader && prevLeader.MasterID != "" && leader.MasterID == "":
+		s.logger.Printf("leader cleared")
+	}
+}
+
+func (s *masterServer) leaderSnapshot() (bool, election.LeaderRecord) {
+	s.leaderMu.RLock()
+	defer s.leaderMu.RUnlock()
+	return s.isLeader, s.leaderRecord
+}
+
+func (s *masterServer) shouldSchedule() bool {
+	isLeader, _ := s.leaderSnapshot()
+	return isLeader
 }
 
 func (s *masterServer) runWorkerWatchLoop(ctx context.Context) {
@@ -1013,6 +1271,36 @@ func intEnvOrDefault(key string, defaultValue int) (int, error) {
 		return defaultValue, nil
 	}
 	return strconv.Atoi(value)
+}
+
+func int64EnvOrDefault(key string, defaultValue int64) (int64, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue, nil
+	}
+	return strconv.ParseInt(value, 10, 64)
+}
+
+func defaultAdvertiseAddr(bindAddr, host string) string {
+	bindAddr = strings.TrimSpace(bindAddr)
+	host = strings.TrimSpace(host)
+	if bindAddr == "" {
+		return ""
+	}
+
+	resolvedHost, port, err := net.SplitHostPort(bindAddr)
+	if err != nil {
+		return bindAddr
+	}
+
+	resolvedHost = strings.TrimSpace(resolvedHost)
+	if resolvedHost == "" || resolvedHost == "0.0.0.0" || resolvedHost == "::" {
+		if host == "" {
+			return bindAddr
+		}
+		return net.JoinHostPort(host, port)
+	}
+	return net.JoinHostPort(resolvedHost, port)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
