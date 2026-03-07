@@ -10,37 +10,66 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	scheduler "github.com/HITGerhman/distributed-job-scheduler/api/proto"
+	"github.com/HITGerhman/distributed-job-scheduler/internal/discovery"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type config struct {
-	WorkerGRPCAddr string
-	MasterGRPCAddr string
-	WorkerID       string
-	LogDir         string
+	WorkerGRPCAddr        string
+	WorkerAdvertiseAddr   string
+	MasterGRPCAddr        string
+	WorkerID              string
+	LogDir                string
+	EtcdEndpoints         []string
+	EtcdDialTimeout       time.Duration
+	WorkerDiscoveryPrefix string
+	WorkerLeaseTTL        int64
 }
 
 type workerServer struct {
 	scheduler.UnimplementedWorkerServer
 	cfg     config
 	logger  *log.Logger
+	etcd    *clientv3.Client
 	mu      sync.Mutex
 	running map[int64]context.CancelFunc
 }
 
 func main() {
+	etcdDialTimeout, err := durationEnvOrDefault("ETCD_DIAL_TIMEOUT", discovery.DefaultEtcdDialTimeout)
+	if err != nil {
+		log.Fatalf("invalid ETCD_DIAL_TIMEOUT: %v", err)
+	}
+	workerLeaseTTL, err := int64EnvOrDefault("WORKER_LEASE_TTL", discovery.DefaultLeaseTTLSeconds)
+	if err != nil {
+		log.Fatalf("invalid WORKER_LEASE_TTL: %v", err)
+	}
+	if workerLeaseTTL <= 0 {
+		log.Fatalf("WORKER_LEASE_TTL must be > 0, got %d", workerLeaseTTL)
+	}
+
 	cfg := config{
-		WorkerGRPCAddr: envOrDefault("WORKER_GRPC_ADDR", ":50051"),
-		MasterGRPCAddr: envOrDefault("MASTER_GRPC_ADDR", "master:50052"),
-		WorkerID:       envOrDefault("WORKER_ID", "worker-1"),
-		LogDir:         envOrDefault("LOG_DIR", "/app/logs"),
+		WorkerGRPCAddr:        envOrDefault("WORKER_GRPC_ADDR", ":50051"),
+		WorkerAdvertiseAddr:   envOrDefault("WORKER_ADVERTISE_ADDR", envOrDefault("WORKER_GRPC_ADDR", ":50051")),
+		MasterGRPCAddr:        envOrDefault("MASTER_GRPC_ADDR", "master:50052"),
+		WorkerID:              envOrDefault("WORKER_ID", "worker-1"),
+		LogDir:                envOrDefault("LOG_DIR", "/app/logs"),
+		EtcdEndpoints:         discovery.ParseEtcdEndpoints(envOrDefault("ETCD_ENDPOINTS", discovery.DefaultEtcdEndpointsRaw)),
+		EtcdDialTimeout:       etcdDialTimeout,
+		WorkerDiscoveryPrefix: discovery.NormalizeWorkerPrefix(envOrDefault("WORKER_DISCOVERY_PREFIX", discovery.DefaultWorkerPrefix)),
+		WorkerLeaseTTL:        workerLeaseTTL,
+	}
+	if len(cfg.EtcdEndpoints) == 0 {
+		log.Fatalf("no ETCD_ENDPOINTS configured")
 	}
 
 	if err := os.MkdirAll(cfg.LogDir, 0o755); err != nil {
@@ -48,9 +77,19 @@ func main() {
 	}
 
 	logger := log.New(os.Stdout, "[worker] ", log.LstdFlags|log.Lmicroseconds)
+	etcdClient, err := clientv3.New(clientv3.Config{
+		Endpoints:   cfg.EtcdEndpoints,
+		DialTimeout: cfg.EtcdDialTimeout,
+	})
+	if err != nil {
+		logger.Fatalf("create etcd client failed: %v", err)
+	}
+	defer etcdClient.Close()
+
 	srv := &workerServer{
 		cfg:     cfg,
 		logger:  logger,
+		etcd:    etcdClient,
 		running: make(map[int64]context.CancelFunc),
 	}
 
@@ -62,9 +101,99 @@ func main() {
 	grpcServer := grpc.NewServer()
 	scheduler.RegisterWorkerServer(grpcServer, srv)
 
-	logger.Printf("worker started: grpc=%s master=%s", cfg.WorkerGRPCAddr, cfg.MasterGRPCAddr)
+	go srv.runRegistrationLoop(context.Background())
+
+	logger.Printf(
+		"worker started: grpc=%s advertise=%s master=%s etcd=%v lease_ttl=%d",
+		cfg.WorkerGRPCAddr,
+		cfg.WorkerAdvertiseAddr,
+		cfg.MasterGRPCAddr,
+		cfg.EtcdEndpoints,
+		cfg.WorkerLeaseTTL,
+	)
 	if err := grpcServer.Serve(lis); err != nil {
 		logger.Fatalf("worker grpc serve failed: %v", err)
+	}
+}
+
+func (s *workerServer) runRegistrationLoop(ctx context.Context) {
+	for {
+		err := s.registerWorker(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			s.logger.Printf("worker registration loop error: %v", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (s *workerServer) registerWorker(ctx context.Context) error {
+	registration := discovery.WorkerRegistration{
+		ID:           s.cfg.WorkerID,
+		Addr:         s.cfg.WorkerAdvertiseAddr,
+		RegisteredAt: time.Now().UTC(),
+	}
+	value, err := discovery.EncodeWorkerRegistration(registration)
+	if err != nil {
+		return fmt.Errorf("encode worker registration failed: %w", err)
+	}
+
+	leaseCtx, cancelLease := context.WithTimeout(ctx, 5*time.Second)
+	leaseResp, err := s.etcd.Grant(leaseCtx, s.cfg.WorkerLeaseTTL)
+	cancelLease()
+	if err != nil {
+		return fmt.Errorf("grant worker lease failed: %w", err)
+	}
+
+	key := discovery.WorkerKey(s.cfg.WorkerDiscoveryPrefix, s.cfg.WorkerID)
+	putCtx, cancelPut := context.WithTimeout(ctx, 5*time.Second)
+	_, err = s.etcd.Put(putCtx, key, string(value), clientv3.WithLease(leaseResp.ID))
+	cancelPut()
+	if err != nil {
+		return fmt.Errorf("put worker registration failed: %w", err)
+	}
+
+	keepAliveCtx, cancelKeepAlive := context.WithCancel(ctx)
+	defer cancelKeepAlive()
+
+	keepAliveCh, err := s.etcd.KeepAlive(keepAliveCtx, leaseResp.ID)
+	if err != nil {
+		s.revokeLease(leaseResp.ID)
+		return fmt.Errorf("worker keepalive failed: %w", err)
+	}
+
+	s.logger.Printf(
+		"worker registered: key=%s id=%s addr=%s lease_id=%d ttl=%d",
+		key,
+		s.cfg.WorkerID,
+		s.cfg.WorkerAdvertiseAddr,
+		leaseResp.ID,
+		s.cfg.WorkerLeaseTTL,
+	)
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.revokeLease(leaseResp.ID)
+			return ctx.Err()
+		case resp, ok := <-keepAliveCh:
+			if !ok || resp == nil {
+				return fmt.Errorf("worker keepalive channel closed")
+			}
+		}
+	}
+}
+
+func (s *workerServer) revokeLease(leaseID clientv3.LeaseID) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if _, err := s.etcd.Revoke(ctx, leaseID); err != nil {
+		s.logger.Printf("revoke worker lease failed: lease_id=%d err=%v", leaseID, err)
 	}
 }
 
@@ -249,4 +378,20 @@ func envOrDefault(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func durationEnvOrDefault(key string, defaultValue time.Duration) (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue, nil
+	}
+	return time.ParseDuration(value)
+}
+
+func int64EnvOrDefault(key string, defaultValue int64) (int64, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue, nil
+	}
+	return strconv.ParseInt(value, 10, 64)
 }

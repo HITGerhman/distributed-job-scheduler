@@ -58,10 +58,15 @@ services:
       MASTER_GRPC_ADDR: :50052
       MASTER_HTTP_ADDR: :8080
       WORKER_GRPC_ADDR: worker:50051
+      ETCD_ENDPOINTS: http://etcd:2379
+      ETCD_DIAL_TIMEOUT: 5s
+      WORKER_DISCOVERY_PREFIX: /workers/
     ports:
       - "8080:8080"
     depends_on:
       mysql:
+        condition: service_healthy
+      etcd:
         condition: service_healthy
 
   worker:
@@ -69,10 +74,17 @@ services:
     command: ["go", "run", "./cmd/worker"]
     environment:
       WORKER_GRPC_ADDR: :50051
+      WORKER_ADVERTISE_ADDR: worker:50051
       MASTER_GRPC_ADDR: master:50052
       WORKER_ID: worker-1
       LOG_DIR: /app/logs
+      ETCD_ENDPOINTS: http://etcd:2379
+      ETCD_DIAL_TIMEOUT: 5s
+      WORKER_DISCOVERY_PREFIX: /workers/
+      WORKER_LEASE_TTL: 10
     depends_on:
+      etcd:
+        condition: service_healthy
       master:
         condition: service_started
 

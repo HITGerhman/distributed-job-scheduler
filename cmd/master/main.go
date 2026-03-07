@@ -10,13 +10,18 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	scheduler "github.com/HITGerhman/distributed-job-scheduler/api/proto"
+	"github.com/HITGerhman/distributed-job-scheduler/internal/discovery"
 	mysql "github.com/go-sql-driver/mysql"
 	"github.com/robfig/cron/v3"
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -38,6 +43,9 @@ type config struct {
 	MasterGRPCAddr         string
 	MasterHTTPAddr         string
 	WorkerGRPCAddr         string
+	EtcdEndpoints          []string
+	EtcdDialTimeout        time.Duration
+	WorkerDiscoveryPrefix  string
 	SchedulerTickInterval  time.Duration
 	SchedulerCatchupWindow time.Duration
 	SchedulerMaxCatchup    int
@@ -45,9 +53,14 @@ type config struct {
 
 type masterServer struct {
 	scheduler.UnimplementedMasterServer
-	db     *sql.DB
-	cfg    config
-	logger *log.Logger
+	db              *sql.DB
+	cfg             config
+	logger          *log.Logger
+	etcd            *clientv3.Client
+	workersMu       sync.RWMutex
+	workers         map[string]discovery.WorkerRegistration
+	workerOrder     []string
+	nextWorkerIndex int
 }
 
 type createJobRequest struct {
@@ -90,6 +103,10 @@ type triggerMode struct {
 }
 
 func main() {
+	etcdDialTimeout, err := durationEnvOrDefault("ETCD_DIAL_TIMEOUT", discovery.DefaultEtcdDialTimeout)
+	if err != nil {
+		log.Fatalf("invalid ETCD_DIAL_TIMEOUT: %v", err)
+	}
 	schedulerTickInterval, err := durationEnvOrDefault("SCHEDULER_TICK_INTERVAL", defaultSchedulerTickInterval)
 	if err != nil {
 		log.Fatalf("invalid SCHEDULER_TICK_INTERVAL: %v", err)
@@ -111,9 +128,15 @@ func main() {
 		MasterGRPCAddr:         envOrDefault("MASTER_GRPC_ADDR", ":50052"),
 		MasterHTTPAddr:         envOrDefault("MASTER_HTTP_ADDR", ":8080"),
 		WorkerGRPCAddr:         envOrDefault("WORKER_GRPC_ADDR", "worker:50051"),
+		EtcdEndpoints:          discovery.ParseEtcdEndpoints(envOrDefault("ETCD_ENDPOINTS", discovery.DefaultEtcdEndpointsRaw)),
+		EtcdDialTimeout:        etcdDialTimeout,
+		WorkerDiscoveryPrefix:  discovery.NormalizeWorkerPrefix(envOrDefault("WORKER_DISCOVERY_PREFIX", discovery.DefaultWorkerPrefix)),
 		SchedulerTickInterval:  schedulerTickInterval,
 		SchedulerCatchupWindow: schedulerCatchupWindow,
 		SchedulerMaxCatchup:    schedulerMaxCatchup,
+	}
+	if len(cfg.EtcdEndpoints) == 0 {
+		log.Fatalf("no ETCD_ENDPOINTS configured")
 	}
 
 	logger := log.New(os.Stdout, "[master] ", log.LstdFlags|log.Lmicroseconds)
@@ -132,7 +155,22 @@ func main() {
 		logger.Fatalf("ping mysql failed: %v", err)
 	}
 
-	srv := &masterServer{db: db, cfg: cfg, logger: logger}
+	etcdClient, err := clientv3.New(clientv3.Config{
+		Endpoints:   cfg.EtcdEndpoints,
+		DialTimeout: cfg.EtcdDialTimeout,
+	})
+	if err != nil {
+		logger.Fatalf("create etcd client failed: %v", err)
+	}
+	defer etcdClient.Close()
+
+	srv := &masterServer{
+		db:      db,
+		cfg:     cfg,
+		logger:  logger,
+		etcd:    etcdClient,
+		workers: make(map[string]discovery.WorkerRegistration),
+	}
 	errCh := make(chan error, 2)
 
 	go func() {
@@ -143,13 +181,15 @@ func main() {
 		errCh <- srv.serveHTTP(cfg.MasterHTTPAddr)
 	}()
 
+	go srv.runWorkerWatchLoop(context.Background())
 	go srv.runSchedulerLoop(context.Background())
 
 	logger.Printf(
-		"master started: grpc=%s http=%s worker=%s scheduler_tick=%s catchup_window=%s max_catchup=%d",
+		"master started: grpc=%s http=%s worker_fallback=%s etcd=%v scheduler_tick=%s catchup_window=%s max_catchup=%d",
 		cfg.MasterGRPCAddr,
 		cfg.MasterHTTPAddr,
 		cfg.WorkerGRPCAddr,
+		cfg.EtcdEndpoints,
 		cfg.SchedulerTickInterval,
 		cfg.SchedulerCatchupWindow,
 		cfg.SchedulerMaxCatchup,
@@ -189,7 +229,10 @@ func (s *masterServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":  "ok",
+		"workers": s.workerCount(),
+	})
 }
 
 func (s *masterServer) handleCreateJob(w http.ResponseWriter, r *http.Request) {
@@ -527,7 +570,8 @@ func (s *masterServer) triggerJob(
 		ScheduledAt:    timestamppb.New(normalizedScheduledAt),
 	}
 
-	if err := s.dispatchRunJob(ctx, runReq); err != nil {
+	worker, err := s.dispatchRunJob(ctx, runReq)
+	if err != nil {
 		if mode.MarkFailedOnDispatchError {
 			s.markDispatchFailed(ctx, instance.ID, err)
 		}
@@ -539,13 +583,14 @@ func (s *masterServer) triggerJob(
 		action = "redispatch pending job"
 	}
 	s.logger.Printf(
-		"%s: source=%s job_id=%d instance_id=%d scheduled_at=%s worker=%s",
+		"%s: source=%s job_id=%d instance_id=%d scheduled_at=%s worker_id=%s worker_addr=%s",
 		action,
 		mode.Source,
 		job.ID,
 		instance.ID,
 		normalizedScheduledAt.Format(time.RFC3339Nano),
-		s.cfg.WorkerGRPCAddr,
+		worker.ID,
+		worker.Addr,
 	)
 	return instance, nil
 }
@@ -604,28 +649,206 @@ func (s *masterServer) markDispatchFailed(ctx context.Context, instanceID int64,
 	}
 }
 
-func (s *masterServer) dispatchRunJob(parent context.Context, req *scheduler.RunJobRequest) error {
+func (s *masterServer) runWorkerWatchLoop(ctx context.Context) {
+	for {
+		err := s.syncAndWatchWorkers(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			s.logger.Printf("worker watch loop error: %v", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (s *masterServer) syncAndWatchWorkers(ctx context.Context) error {
+	getCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	resp, err := s.etcd.Get(getCtx, s.cfg.WorkerDiscoveryPrefix, clientv3.WithPrefix())
+	cancel()
+	if err != nil {
+		return fmt.Errorf("load workers snapshot failed: %w", err)
+	}
+
+	snapshot := make(map[string]discovery.WorkerRegistration, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		reg, decodeErr := discovery.DecodeWorkerRegistration(kv.Value)
+		if decodeErr != nil {
+			s.logger.Printf("skip invalid worker registration: key=%s err=%v", string(kv.Key), decodeErr)
+			continue
+		}
+		snapshot[reg.ID] = reg
+	}
+	s.replaceWorkers(snapshot)
+
+	watchCh := s.etcd.Watch(
+		ctx,
+		s.cfg.WorkerDiscoveryPrefix,
+		clientv3.WithPrefix(),
+		clientv3.WithRev(resp.Header.Revision+1),
+	)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case watchResp, ok := <-watchCh:
+			if !ok {
+				return fmt.Errorf("worker watch channel closed")
+			}
+			if err := watchResp.Err(); err != nil {
+				return fmt.Errorf("worker watch failed: %w", err)
+			}
+
+			for _, event := range watchResp.Events {
+				switch event.Type {
+				case mvccpb.PUT:
+					reg, decodeErr := discovery.DecodeWorkerRegistration(event.Kv.Value)
+					if decodeErr != nil {
+						s.logger.Printf("skip invalid worker update: key=%s err=%v", string(event.Kv.Key), decodeErr)
+						continue
+					}
+					s.upsertWorker(reg)
+				case mvccpb.DELETE:
+					workerID, ok := discovery.WorkerIDFromKey(s.cfg.WorkerDiscoveryPrefix, string(event.Kv.Key))
+					if !ok {
+						s.logger.Printf("skip invalid worker delete key: %s", string(event.Kv.Key))
+						continue
+					}
+					s.removeWorker(workerID)
+				}
+			}
+		}
+	}
+}
+
+func (s *masterServer) replaceWorkers(snapshot map[string]discovery.WorkerRegistration) {
+	s.workersMu.Lock()
+	defer s.workersMu.Unlock()
+
+	for workerID, reg := range snapshot {
+		if prev, ok := s.workers[workerID]; !ok {
+			s.logger.Printf("worker discovered: id=%s addr=%s", reg.ID, reg.Addr)
+		} else if prev.Addr != reg.Addr {
+			s.logger.Printf("worker updated: id=%s addr=%s -> %s", reg.ID, prev.Addr, reg.Addr)
+		}
+	}
+	for workerID, reg := range s.workers {
+		if _, ok := snapshot[workerID]; !ok {
+			s.logger.Printf("worker removed: id=%s addr=%s", reg.ID, reg.Addr)
+		}
+	}
+
+	s.workers = snapshot
+	s.workerOrder = sortedWorkerIDs(snapshot)
+	if s.nextWorkerIndex >= len(s.workerOrder) {
+		s.nextWorkerIndex = 0
+	}
+}
+
+func (s *masterServer) upsertWorker(reg discovery.WorkerRegistration) {
+	s.workersMu.Lock()
+	defer s.workersMu.Unlock()
+
+	prev, existed := s.workers[reg.ID]
+	s.workers[reg.ID] = reg
+	s.workerOrder = sortedWorkerIDs(s.workers)
+	if s.nextWorkerIndex >= len(s.workerOrder) {
+		s.nextWorkerIndex = 0
+	}
+
+	if !existed {
+		s.logger.Printf("worker discovered: id=%s addr=%s", reg.ID, reg.Addr)
+		return
+	}
+	if prev.Addr != reg.Addr {
+		s.logger.Printf("worker updated: id=%s addr=%s -> %s", reg.ID, prev.Addr, reg.Addr)
+	}
+}
+
+func (s *masterServer) removeWorker(workerID string) {
+	s.workersMu.Lock()
+	defer s.workersMu.Unlock()
+
+	reg, existed := s.workers[workerID]
+	if !existed {
+		return
+	}
+	delete(s.workers, workerID)
+	s.workerOrder = sortedWorkerIDs(s.workers)
+	if s.nextWorkerIndex >= len(s.workerOrder) {
+		s.nextWorkerIndex = 0
+	}
+	s.logger.Printf("worker removed: id=%s addr=%s", reg.ID, reg.Addr)
+}
+
+func (s *masterServer) selectWorker() (discovery.WorkerRegistration, error) {
+	s.workersMu.Lock()
+	defer s.workersMu.Unlock()
+
+	if len(s.workerOrder) == 0 {
+		return discovery.WorkerRegistration{}, fmt.Errorf("no workers available")
+	}
+
+	for attempts := 0; attempts < len(s.workerOrder); attempts++ {
+		if s.nextWorkerIndex >= len(s.workerOrder) {
+			s.nextWorkerIndex = 0
+		}
+		workerID := s.workerOrder[s.nextWorkerIndex]
+		s.nextWorkerIndex = (s.nextWorkerIndex + 1) % len(s.workerOrder)
+
+		reg, ok := s.workers[workerID]
+		if ok {
+			return reg, nil
+		}
+	}
+
+	return discovery.WorkerRegistration{}, fmt.Errorf("no workers available")
+}
+
+func (s *masterServer) workerCount() int {
+	s.workersMu.RLock()
+	defer s.workersMu.RUnlock()
+	return len(s.workers)
+}
+
+func sortedWorkerIDs(workers map[string]discovery.WorkerRegistration) []string {
+	workerIDs := make([]string, 0, len(workers))
+	for workerID := range workers {
+		workerIDs = append(workerIDs, workerID)
+	}
+	sort.Strings(workerIDs)
+	return workerIDs
+}
+
+func (s *masterServer) dispatchRunJob(parent context.Context, req *scheduler.RunJobRequest) (discovery.WorkerRegistration, error) {
+	worker, err := s.selectWorker()
+	if err != nil {
+		return discovery.WorkerRegistration{}, err
+	}
+
 	ctx, cancel := context.WithTimeout(parent, 6*time.Second)
 	defer cancel()
 
-	conn, err := grpc.DialContext(ctx, s.cfg.WorkerGRPCAddr,
+	conn, err := grpc.DialContext(ctx, worker.Addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
 	)
 	if err != nil {
-		return fmt.Errorf("dial worker failed: %w", err)
+		return discovery.WorkerRegistration{}, fmt.Errorf("dial worker %s(%s) failed: %w", worker.ID, worker.Addr, err)
 	}
 	defer conn.Close()
 
 	client := scheduler.NewWorkerClient(conn)
 	resp, err := client.RunJob(ctx, req)
 	if err != nil {
-		return fmt.Errorf("worker RunJob failed: %w", err)
+		return discovery.WorkerRegistration{}, fmt.Errorf("worker %s(%s) RunJob failed: %w", worker.ID, worker.Addr, err)
 	}
 	if !resp.GetAccepted() {
-		return fmt.Errorf("worker rejected run job: %s", resp.GetMessage())
+		return discovery.WorkerRegistration{}, fmt.Errorf("worker %s(%s) rejected run job: %s", worker.ID, worker.Addr, resp.GetMessage())
 	}
-	return nil
+	return worker, nil
 }
 
 func (s *masterServer) ReportResult(ctx context.Context, req *scheduler.ReportResultRequest) (*scheduler.ReportResultResponse, error) {

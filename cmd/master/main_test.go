@@ -3,6 +3,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/HITGerhman/distributed-job-scheduler/internal/discovery"
 )
 
 func TestParseCronScheduleWithSeconds(t *testing.T) {
@@ -85,5 +87,34 @@ func TestNormalizeScheduledAt(t *testing.T) {
 	want := time.Date(2026, 3, 7, 4, 0, 0, 123_000_000, time.UTC)
 	if !got.Equal(want) {
 		t.Fatalf("normalizeScheduledAt() = %s, want %s", got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+}
+
+func TestSelectWorkerRoundRobin(t *testing.T) {
+	t.Parallel()
+
+	srv := &masterServer{
+		workers: map[string]discovery.WorkerRegistration{
+			"worker-b": {ID: "worker-b", Addr: "worker-b:50051"},
+			"worker-a": {ID: "worker-a", Addr: "worker-a:50051"},
+		},
+		workerOrder: []string{"worker-a", "worker-b"},
+	}
+
+	first, err := srv.selectWorker()
+	if err != nil {
+		t.Fatalf("selectWorker() error = %v", err)
+	}
+	second, err := srv.selectWorker()
+	if err != nil {
+		t.Fatalf("selectWorker() second error = %v", err)
+	}
+	third, err := srv.selectWorker()
+	if err != nil {
+		t.Fatalf("selectWorker() third error = %v", err)
+	}
+
+	if first.ID != "worker-a" || second.ID != "worker-b" || third.ID != "worker-a" {
+		t.Fatalf("round robin order = [%s %s %s]", first.ID, second.ID, third.ID)
 	}
 }
