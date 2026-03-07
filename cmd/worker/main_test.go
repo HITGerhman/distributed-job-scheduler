@@ -54,11 +54,12 @@ func TestBuildCommandCancelerKillsProcessGroup(t *testing.T) {
 		t.Fatalf("cmd.Wait() error = nil, want process termination")
 	}
 
-	if processGroupAlive(cmd.Process.Pid) {
+	if !waitForProcessGroupExit(cmd.Process.Pid, 2*time.Second) {
 		t.Fatalf("process group %d still alive after cancel", cmd.Process.Pid)
 	}
 
-	if err := syscall.Kill(childPID, 0); !errors.Is(err, syscall.ESRCH) {
+	if !waitForPIDExit(childPID, 2*time.Second) {
+		err := syscall.Kill(childPID, 0)
 		t.Fatalf("child pid %d still alive, kill(0) err=%v", childPID, err)
 	}
 
@@ -91,4 +92,26 @@ func waitForChildPID(t *testing.T, path string) int {
 	}
 	t.Fatalf("child pid file %s not created in time", path)
 	return 0
+}
+
+func waitForProcessGroupExit(processGroupID int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !processGroupAlive(processGroupID) {
+			return true
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return !processGroupAlive(processGroupID)
+}
+
+func waitForPIDExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return true
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
 }

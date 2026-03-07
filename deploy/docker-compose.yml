@@ -21,6 +21,7 @@ x-master-service: &master-service
     LEADER_ELECTION_KEY: /masters/leader
     MASTER_LEASE_TTL: 5
     DISPATCH_ACK_TIMEOUT: 5s
+    METRICS_POLL_INTERVAL: 1s
   depends_on:
     mysql:
       condition: service_healthy
@@ -68,6 +69,20 @@ services:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p172600"]
       interval: 5s
       timeout: 3s
+      retries: 20
+
+  mongo:
+    image: mongo:8.0
+    container_name: mongo
+    restart: unless-stopped
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "mongodb://127.0.0.1:27017/admin", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 5s
+      timeout: 5s
       retries: 20
 
   master-1:
@@ -129,6 +144,7 @@ services:
     command: ["go", "run", "./cmd/worker"]
     environment:
       WORKER_GRPC_ADDR: :50051
+      WORKER_HTTP_ADDR: :8083
       WORKER_ADVERTISE_ADDR: worker:50051
       MASTER_GRPC_ADDRS: master-1:50052,master-2:50052,master-3:50052
       WORKER_ID: worker-1
@@ -142,8 +158,18 @@ services:
       WORKER_HEARTBEAT_INTERVAL: 2s
       WORKER_COMPLETED_TTL: 30m
       WORKER_KILL_GRACE_PERIOD: 3s
+      WORKER_LOG_MONGO_URI: mongodb://mongo:27017
+      WORKER_LOG_MONGO_DATABASE: DJS
+      WORKER_LOG_MONGO_COLLECTION: job_logs
+      WORKER_LOG_MONGO_CONNECT_TIMEOUT: 5s
+      WORKER_LOG_MONGO_WRITE_TIMEOUT: 5s
+      WORKER_LOG_BUFFER_SIZE: 4096
+      WORKER_LOG_BATCH_SIZE: 200
+      WORKER_LOG_BATCH_WINDOW: 1s
     depends_on:
       etcd:
+        condition: service_healthy
+      mongo:
         condition: service_healthy
       master-1:
         condition: service_started
@@ -151,10 +177,13 @@ services:
         condition: service_started
       master-3:
         condition: service_started
+    ports:
+      - "8083:8083"
 
 volumes:
   etcd_data:
     name: DJS_etcd_data
   mysql_data:
+  mongo_data:
   go-mod-cache:
   go-build-cache:

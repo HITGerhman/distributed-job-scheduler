@@ -13,8 +13,8 @@ fi
 # Ensure mysql service is up.
 docker compose -f "$COMPOSE_FILE" up -d mysql >/dev/null
 
-# Apply schema using container env MYSQL_ROOT_PASSWORD.
-docker compose -f "$COMPOSE_FILE" exec -T mysql sh -lc 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD"' < "$SCHEMA_FILE"
+# Apply schema using container env MYSQL_ROOT_PASSWORD without command-line password warnings.
+docker compose -f "$COMPOSE_FILE" exec -T mysql sh -lc 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot' < "$SCHEMA_FILE"
 
 ensure_column() {
   local table_name=$1
@@ -23,11 +23,11 @@ ensure_column() {
 
   local exists
   exists=$(docker compose -f "$COMPOSE_FILE" exec -T mysql sh -lc \
-    "mysql -N -B -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -e \"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='DJS' AND table_name='${table_name}' AND column_name='${column_name}';\"")
+    "MYSQL_PWD=\"\$MYSQL_ROOT_PASSWORD\" mysql -N -B -uroot -e \"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='DJS' AND table_name='${table_name}' AND column_name='${column_name}';\"")
 
   if [[ "$exists" == "0" ]]; then
     docker compose -f "$COMPOSE_FILE" exec -T mysql sh -lc \
-      "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -e \"USE DJS; ALTER TABLE ${table_name} ADD COLUMN ${column_name} ${column_ddl};\""
+      "MYSQL_PWD=\"\$MYSQL_ROOT_PASSWORD\" mysql -uroot -e \"USE DJS; ALTER TABLE ${table_name} ADD COLUMN ${column_name} ${column_ddl};\""
   fi
 }
 

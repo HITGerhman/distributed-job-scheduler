@@ -62,6 +62,7 @@ type config struct {
 	SchedulerTickInterval   time.Duration
 	SchedulerCatchupWindow  time.Duration
 	SchedulerMaxCatchup     int
+	MetricsPollInterval     time.Duration
 }
 
 type masterServer struct {
@@ -77,6 +78,7 @@ type masterServer struct {
 	leaderMu        sync.RWMutex
 	isLeader        bool
 	leaderRecord    election.LeaderRecord
+	metrics         *masterMetrics
 }
 
 type createJobRequest struct {
@@ -192,6 +194,13 @@ func main() {
 	if schedulerMaxCatchup <= 0 {
 		log.Fatalf("SCHEDULER_MAX_CATCHUP must be > 0, got %d", schedulerMaxCatchup)
 	}
+	metricsPollInterval, err := durationEnvOrDefault("METRICS_POLL_INTERVAL", defaultMetricsPollInterval)
+	if err != nil {
+		log.Fatalf("invalid METRICS_POLL_INTERVAL: %v", err)
+	}
+	if metricsPollInterval <= 0 {
+		log.Fatalf("METRICS_POLL_INTERVAL must be > 0, got %s", metricsPollInterval)
+	}
 
 	cfg := config{
 		MySQLDSN:               envOrDefault("MYSQL_DSN", "root:172600@tcp(mysql:3306)/DJS?parseTime=true&loc=UTC"),
@@ -208,6 +217,7 @@ func main() {
 		SchedulerTickInterval:  schedulerTickInterval,
 		SchedulerCatchupWindow: schedulerCatchupWindow,
 		SchedulerMaxCatchup:    schedulerMaxCatchup,
+		MetricsPollInterval:    metricsPollInterval,
 	}
 	cfg.MasterAdvertiseGRPCAddr = envOrDefault("MASTER_ADVERTISE_GRPC_ADDR", defaultAdvertiseAddr(cfg.MasterGRPCAddr, cfg.MasterID))
 	cfg.MasterAdvertiseHTTPAddr = envOrDefault("MASTER_ADVERTISE_HTTP_ADDR", defaultAdvertiseAddr(cfg.MasterHTTPAddr, cfg.MasterID))
@@ -240,13 +250,17 @@ func main() {
 	}
 	defer etcdClient.Close()
 
+	metrics := newMasterMetrics()
+
 	srv := &masterServer{
 		db:      db,
 		cfg:     cfg,
 		logger:  logger,
 		etcd:    etcdClient,
 		workers: make(map[string]discovery.WorkerRegistration),
+		metrics: metrics,
 	}
+	srv.sampleQueueDepth(context.Background())
 	errCh := make(chan error, 2)
 
 	go func() {
@@ -260,9 +274,10 @@ func main() {
 	go srv.runWorkerWatchLoop(context.Background())
 	go srv.runLeaderElectionLoop(context.Background())
 	go srv.runSchedulerLoop(context.Background())
+	go srv.runMetricsLoop(context.Background())
 
 	logger.Printf(
-		"master started: id=%s grpc=%s advertise_grpc=%s http=%s advertise_http=%s worker_fallback=%s etcd=%v leader_key=%s lease_ttl=%d dispatch_ack_timeout=%s scheduler_tick=%s catchup_window=%s max_catchup=%d",
+		"master started: id=%s grpc=%s advertise_grpc=%s http=%s advertise_http=%s worker_fallback=%s etcd=%v leader_key=%s lease_ttl=%d dispatch_ack_timeout=%s scheduler_tick=%s catchup_window=%s max_catchup=%d metrics_poll=%s",
 		cfg.MasterID,
 		cfg.MasterGRPCAddr,
 		cfg.MasterAdvertiseGRPCAddr,
@@ -276,6 +291,7 @@ func main() {
 		cfg.SchedulerTickInterval,
 		cfg.SchedulerCatchupWindow,
 		cfg.SchedulerMaxCatchup,
+		cfg.MetricsPollInterval,
 	)
 	if err := <-errCh; err != nil {
 		logger.Fatalf("server exited: %v", err)
@@ -295,6 +311,7 @@ func (s *masterServer) serveGRPC(addr string) error {
 func (s *masterServer) serveHTTP(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.Handle("/metrics", s.metrics.handler())
 	mux.HandleFunc("/jobs", s.handleCreateJob)
 	mux.HandleFunc("/jobs/", s.handleTriggerJob)
 	mux.HandleFunc("/job-instances/", s.handleJobInstance)
@@ -746,7 +763,16 @@ func (s *masterServer) triggerJob(
 ) (jobInstanceRecord, error) {
 	normalizedScheduledAt := normalizeScheduledAt(scheduledAt)
 
-	instance, created, err := s.ensureJobInstance(ctx, job, normalizedScheduledAt)
+	var (
+		instance jobInstanceRecord
+		created  bool
+		err      error
+	)
+	if mode.Source == "manual" {
+		instance, created, err = s.createManualJobInstance(ctx, job, normalizedScheduledAt)
+	} else {
+		instance, created, err = s.ensureJobInstance(ctx, job, normalizedScheduledAt)
+	}
 	if err != nil {
 		return jobInstanceRecord{}, err
 	}
@@ -784,7 +810,37 @@ func (s *masterServer) triggerJob(
 	return dispatched, nil
 }
 
+func (s *masterServer) createManualJobInstance(ctx context.Context, job jobRecord, scheduledAt time.Time) (jobInstanceRecord, bool, error) {
+	for offset := 0; offset < 1000; offset++ {
+		candidate := scheduledAt.Add(time.Duration(offset) * time.Millisecond)
+		instance, err := s.insertJobInstance(ctx, job, candidate)
+		if err == nil {
+			return instance, true, nil
+		}
+		if !isDuplicateKeyError(err) {
+			return jobInstanceRecord{}, false, fmt.Errorf("insert manual job instance failed: %w", err)
+		}
+	}
+	return jobInstanceRecord{}, false, fmt.Errorf("manual trigger slot exhaustion for job %d", job.ID)
+}
+
 func (s *masterServer) ensureJobInstance(ctx context.Context, job jobRecord, scheduledAt time.Time) (jobInstanceRecord, bool, error) {
+	instance, err := s.insertJobInstance(ctx, job, scheduledAt)
+	if err == nil {
+		return instance, true, nil
+	}
+	if !isDuplicateKeyError(err) {
+		return jobInstanceRecord{}, false, fmt.Errorf("insert job instance failed: %w", err)
+	}
+
+	instance, loadErr := s.getJobInstanceBySlot(ctx, job.ID, scheduledAt)
+	if loadErr != nil {
+		return jobInstanceRecord{}, false, fmt.Errorf("load existing job instance failed: %w", loadErr)
+	}
+	return instance, false, nil
+}
+
+func (s *masterServer) insertJobInstance(ctx context.Context, job jobRecord, scheduledAt time.Time) (jobInstanceRecord, error) {
 	maxAttempts := job.MaxRetries + 1
 	if maxAttempts <= 0 {
 		maxAttempts = 1
@@ -803,26 +859,22 @@ func (s *masterServer) ensureJobInstance(ctx context.Context, job jobRecord, sch
 		maxPositive(job.MaxRetryBackoffSeconds, defaultMaxRetryBackoffSeconds),
 		maxPositive(job.HeartbeatTimeoutSeconds, defaultHeartbeatTimeoutSecs),
 	)
-	if err == nil {
-		instanceID, readErr := res.LastInsertId()
-		if readErr != nil {
-			return jobInstanceRecord{}, false, fmt.Errorf("read job instance id failed: %w", readErr)
-		}
-		instance, loadErr := s.getJobInstanceByID(ctx, instanceID)
-		if loadErr != nil {
-			return jobInstanceRecord{}, false, fmt.Errorf("load inserted job instance failed: %w", loadErr)
-		}
-		return instance, true, nil
-	}
-	if !isDuplicateKeyError(err) {
-		return jobInstanceRecord{}, false, fmt.Errorf("insert job instance failed: %w", err)
+	if err != nil {
+		return jobInstanceRecord{}, err
 	}
 
-	instance, loadErr := s.getJobInstanceBySlot(ctx, job.ID, scheduledAt)
-	if loadErr != nil {
-		return jobInstanceRecord{}, false, fmt.Errorf("load existing job instance failed: %w", loadErr)
+	instanceID, readErr := res.LastInsertId()
+	if readErr != nil {
+		return jobInstanceRecord{}, fmt.Errorf("read job instance id failed: %w", readErr)
 	}
-	return instance, false, nil
+	instance, loadErr := s.getJobInstanceByID(ctx, instanceID)
+	if loadErr != nil {
+		return jobInstanceRecord{}, fmt.Errorf("load inserted job instance failed: %w", loadErr)
+	}
+	if s.metrics != nil {
+		s.metrics.observeQueueTransition("", "PENDING")
+	}
+	return instance, nil
 }
 
 func (s *masterServer) dispatchDuePendingInstances(ctx context.Context, now time.Time, source string) {
@@ -1185,6 +1237,10 @@ func (s *masterServer) scheduleRetry(
 	if err != nil {
 		return jobInstanceRecord{}, fmt.Errorf("schedule retry failed: %w", err)
 	}
+	if s.metrics != nil {
+		s.metrics.observeRetry(reason)
+		s.metrics.observeQueueTransition(instance.Status, "PENDING")
+	}
 
 	s.logger.Printf(
 		"retry scheduled: instance_id=%d attempt=%d/%d next_retry_at=%s reason=%s",
@@ -1220,6 +1276,9 @@ func (s *masterServer) markInstanceFailed(
 	if err != nil {
 		return fmt.Errorf("mark instance failed: %w", err)
 	}
+	if s.metrics != nil {
+		s.metrics.observeQueueTransition(instance.Status, "FAILED")
+	}
 
 	s.logger.Printf(
 		"instance failed permanently: instance_id=%d attempt=%d/%d reason=%s",
@@ -1228,6 +1287,9 @@ func (s *masterServer) markInstanceFailed(
 		instance.MaxAttempts,
 		reason,
 	)
+	if s.metrics != nil {
+		s.metrics.observeTerminalInstance("FAILED", instance, failedAt.UTC())
+	}
 	return nil
 }
 
@@ -1254,6 +1316,9 @@ func (s *masterServer) markInstanceKilled(
 	if err == nil && rowsAffected == 0 {
 		return fmt.Errorf("mark instance killed: no pending row updated")
 	}
+	if s.metrics != nil {
+		s.metrics.observeQueueTransition(instance.Status, "KILLED")
+	}
 
 	s.logger.Printf(
 		"instance killed before dispatch: instance_id=%d attempt=%d/%d reason=%s",
@@ -1262,6 +1327,9 @@ func (s *masterServer) markInstanceKilled(
 		instance.MaxAttempts,
 		reason,
 	)
+	if s.metrics != nil {
+		s.metrics.observeTerminalInstance("KILLED", instance, killedAt.UTC())
+	}
 	return nil
 }
 
@@ -1429,6 +1497,10 @@ func (s *masterServer) setLeaderState(isLeader bool, leader election.LeaderRecor
 	s.leaderRecord = leader
 	s.leaderMu.Unlock()
 
+	if s.metrics != nil {
+		s.metrics.observeLeader(leader.MasterID, isLeader)
+	}
+
 	if s.logger == nil {
 		return
 	}
@@ -1561,6 +1633,9 @@ func (s *masterServer) replaceWorkers(snapshot map[string]discovery.WorkerRegist
 	if s.nextWorkerIndex >= len(s.workerOrder) {
 		s.nextWorkerIndex = 0
 	}
+	if s.metrics != nil {
+		s.metrics.setWorkers(len(s.workers))
+	}
 }
 
 func (s *masterServer) upsertWorker(reg discovery.WorkerRegistration) {
@@ -1576,10 +1651,16 @@ func (s *masterServer) upsertWorker(reg discovery.WorkerRegistration) {
 
 	if !existed {
 		s.logger.Printf("worker discovered: id=%s addr=%s", reg.ID, reg.Addr)
+		if s.metrics != nil {
+			s.metrics.setWorkers(len(s.workers))
+		}
 		return
 	}
 	if prev.Addr != reg.Addr {
 		s.logger.Printf("worker updated: id=%s addr=%s -> %s", reg.ID, prev.Addr, reg.Addr)
+	}
+	if s.metrics != nil {
+		s.metrics.setWorkers(len(s.workers))
 	}
 }
 
@@ -1597,6 +1678,9 @@ func (s *masterServer) removeWorker(workerID string) {
 		s.nextWorkerIndex = 0
 	}
 	s.logger.Printf("worker removed: id=%s addr=%s", reg.ID, reg.Addr)
+	if s.metrics != nil {
+		s.metrics.setWorkers(len(s.workers))
+	}
 }
 
 func (s *masterServer) selectWorker(preferredWorkerID string) (discovery.WorkerRegistration, error) {
@@ -1755,15 +1839,16 @@ func (s *masterServer) ReportResult(ctx context.Context, req *scheduler.ReportRe
 
 	now := time.Now().UTC()
 	workerID := nullableWorkerID(req.GetWorkerId(), instance.WorkerID)
-	startedAt := coalesceOptionalTime(req.GetStartedAt(), instance.StartedAt)
+	startedAt := effectiveStartedAt(req.GetStartedAt(), instance.StartedAt, now)
+	finishedAt := effectiveFinishedAt(req.GetFinishedAt(), instance.FinishedAt, now)
 
 	switch nextStatus {
 	case "RUNNING":
 		res, execErr := s.db.ExecContext(
 			ctx,
 			`UPDATE job_instances
-			 SET status='RUNNING', worker_id=?, started_at=?, last_heartbeat_at=?, next_retry_at=NULL, updated_at=CURRENT_TIMESTAMP
-			 WHERE id=? AND attempt=? AND status IN ('PENDING', 'RUNNING')`,
+				 SET status='RUNNING', worker_id=?, started_at=?, last_heartbeat_at=?, next_retry_at=NULL, updated_at=CURRENT_TIMESTAMP
+				 WHERE id=? AND attempt=? AND status IN ('PENDING', 'RUNNING')`,
 			workerID,
 			startedAt,
 			now,
@@ -1777,15 +1862,18 @@ func (s *masterServer) ReportResult(ctx context.Context, req *scheduler.ReportRe
 		if err == nil && rowsAffected == 0 {
 			return &scheduler.ReportResultResponse{Accepted: true, Message: "stale running heartbeat ignored"}, nil
 		}
+		if s.metrics != nil {
+			s.metrics.observeQueueTransition(instance.Status, "RUNNING")
+		}
 	case "SUCCESS":
 		res, execErr := s.db.ExecContext(
 			ctx,
 			`UPDATE job_instances
-			 SET status='SUCCESS', worker_id=?, started_at=?, finished_at=?, exit_code=?, error_message=?, last_heartbeat_at=?, next_retry_at=NULL, updated_at=CURRENT_TIMESTAMP
-			 WHERE id=? AND attempt=? AND status IN ('PENDING', 'RUNNING')`,
+				 SET status='SUCCESS', worker_id=?, started_at=?, finished_at=?, exit_code=?, error_message=?, last_heartbeat_at=?, next_retry_at=NULL, updated_at=CURRENT_TIMESTAMP
+				 WHERE id=? AND attempt=? AND status IN ('PENDING', 'RUNNING')`,
 			workerID,
 			startedAt,
-			coalesceOptionalTime(req.GetFinishedAt(), instance.FinishedAt),
+			finishedAt,
 			req.GetExitCode(),
 			strings.TrimSpace(req.GetErrorMessage()),
 			now,
@@ -1798,6 +1886,10 @@ func (s *masterServer) ReportResult(ctx context.Context, req *scheduler.ReportRe
 		rowsAffected, err := res.RowsAffected()
 		if err == nil && rowsAffected == 0 {
 			return &scheduler.ReportResultResponse{Accepted: true, Message: "stale success report ignored"}, nil
+		}
+		if s.metrics != nil {
+			s.metrics.observeQueueTransition(instance.Status, "SUCCESS")
+			s.metrics.observeTerminalInstance("SUCCESS", instance, finishedAt)
 		}
 	case "FAILED":
 		reason := strings.TrimSpace(req.GetErrorMessage())
@@ -1824,11 +1916,11 @@ func (s *masterServer) ReportResult(ctx context.Context, req *scheduler.ReportRe
 		res, execErr := s.db.ExecContext(
 			ctx,
 			`UPDATE job_instances
-			 SET status='FAILED', worker_id=?, started_at=?, finished_at=?, exit_code=?, error_message=?, last_heartbeat_at=?, next_retry_at=NULL, updated_at=CURRENT_TIMESTAMP
-			 WHERE id=? AND attempt=? AND status IN ('PENDING', 'RUNNING')`,
+				 SET status='FAILED', worker_id=?, started_at=?, finished_at=?, exit_code=?, error_message=?, last_heartbeat_at=?, next_retry_at=NULL, updated_at=CURRENT_TIMESTAMP
+				 WHERE id=? AND attempt=? AND status IN ('PENDING', 'RUNNING')`,
 			workerID,
 			startedAt,
-			coalesceOptionalTime(req.GetFinishedAt(), instance.FinishedAt),
+			finishedAt,
 			req.GetExitCode(),
 			reason,
 			now,
@@ -1842,6 +1934,10 @@ func (s *masterServer) ReportResult(ctx context.Context, req *scheduler.ReportRe
 		if err == nil && rowsAffected == 0 {
 			return &scheduler.ReportResultResponse{Accepted: true, Message: "stale terminal report ignored"}, nil
 		}
+		if s.metrics != nil {
+			s.metrics.observeQueueTransition(instance.Status, "FAILED")
+			s.metrics.observeTerminalInstance("FAILED", instance, finishedAt)
+		}
 	case "KILLED":
 		reason := strings.TrimSpace(req.GetErrorMessage())
 		if reason == "" {
@@ -1850,11 +1946,11 @@ func (s *masterServer) ReportResult(ctx context.Context, req *scheduler.ReportRe
 		res, execErr := s.db.ExecContext(
 			ctx,
 			`UPDATE job_instances
-			 SET status='KILLED', worker_id=?, started_at=?, finished_at=?, exit_code=?, error_message=?, last_heartbeat_at=?, next_retry_at=NULL, updated_at=CURRENT_TIMESTAMP
-			 WHERE id=? AND attempt=? AND status IN ('PENDING', 'RUNNING')`,
+				 SET status='KILLED', worker_id=?, started_at=?, finished_at=?, exit_code=?, error_message=?, last_heartbeat_at=?, next_retry_at=NULL, updated_at=CURRENT_TIMESTAMP
+				 WHERE id=? AND attempt=? AND status IN ('PENDING', 'RUNNING')`,
 			workerID,
 			startedAt,
-			coalesceOptionalTime(req.GetFinishedAt(), instance.FinishedAt),
+			finishedAt,
 			req.GetExitCode(),
 			reason,
 			now,
@@ -1867,6 +1963,10 @@ func (s *masterServer) ReportResult(ctx context.Context, req *scheduler.ReportRe
 		rowsAffected, err := res.RowsAffected()
 		if err == nil && rowsAffected == 0 {
 			return &scheduler.ReportResultResponse{Accepted: true, Message: "stale killed report ignored"}, nil
+		}
+		if s.metrics != nil {
+			s.metrics.observeQueueTransition(instance.Status, "KILLED")
+			s.metrics.observeTerminalInstance("KILLED", instance, finishedAt)
 		}
 	default:
 		return &scheduler.ReportResultResponse{Accepted: false, Message: fmt.Sprintf("unsupported status transition target: %s", nextStatus)}, nil

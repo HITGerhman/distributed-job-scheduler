@@ -39,6 +39,7 @@ var (
 
 type config struct {
 	WorkerGRPCAddr        string
+	WorkerHTTPAddr        string
 	WorkerAdvertiseAddr   string
 	MasterGRPCAddrs       []string
 	WorkerID              string
@@ -52,16 +53,19 @@ type config struct {
 	HeartbeatInterval     time.Duration
 	CompletedStateTTL     time.Duration
 	KillGracePeriod       time.Duration
+	LogBatcher            logBatcherConfig
 }
 
 type workerServer struct {
 	scheduler.UnimplementedWorkerServer
-	cfg     config
-	logger  *log.Logger
-	etcd    *clientv3.Client
-	mu      sync.Mutex
-	running map[int64]*runningExecution
-	done    map[int64]completedExecution
+	cfg        config
+	logger     *log.Logger
+	etcd       *clientv3.Client
+	metrics    *workerMetrics
+	logBatcher *logBatcher
+	mu         sync.Mutex
+	running    map[int64]*runningExecution
+	done       map[int64]completedExecution
 }
 
 type runningExecution struct {
@@ -121,6 +125,41 @@ func main() {
 	if killGracePeriod <= 0 {
 		log.Fatalf("WORKER_KILL_GRACE_PERIOD must be > 0, got %s", killGracePeriod)
 	}
+	logMongoConnectTimeout, err := durationEnvOrDefault("WORKER_LOG_MONGO_CONNECT_TIMEOUT", defaultMongoConnectTimeout)
+	if err != nil {
+		log.Fatalf("invalid WORKER_LOG_MONGO_CONNECT_TIMEOUT: %v", err)
+	}
+	if logMongoConnectTimeout <= 0 {
+		log.Fatalf("WORKER_LOG_MONGO_CONNECT_TIMEOUT must be > 0, got %s", logMongoConnectTimeout)
+	}
+	logMongoWriteTimeout, err := durationEnvOrDefault("WORKER_LOG_MONGO_WRITE_TIMEOUT", defaultMongoWriteTimeout)
+	if err != nil {
+		log.Fatalf("invalid WORKER_LOG_MONGO_WRITE_TIMEOUT: %v", err)
+	}
+	if logMongoWriteTimeout <= 0 {
+		log.Fatalf("WORKER_LOG_MONGO_WRITE_TIMEOUT must be > 0, got %s", logMongoWriteTimeout)
+	}
+	logBufferSize, err := intEnvOrDefault("WORKER_LOG_BUFFER_SIZE", defaultWorkerLogBufferSize)
+	if err != nil {
+		log.Fatalf("invalid WORKER_LOG_BUFFER_SIZE: %v", err)
+	}
+	if logBufferSize <= 0 {
+		log.Fatalf("WORKER_LOG_BUFFER_SIZE must be > 0, got %d", logBufferSize)
+	}
+	logBatchSize, err := intEnvOrDefault("WORKER_LOG_BATCH_SIZE", defaultWorkerLogBatchSize)
+	if err != nil {
+		log.Fatalf("invalid WORKER_LOG_BATCH_SIZE: %v", err)
+	}
+	if logBatchSize <= 0 {
+		log.Fatalf("WORKER_LOG_BATCH_SIZE must be > 0, got %d", logBatchSize)
+	}
+	logBatchWindow, err := durationEnvOrDefault("WORKER_LOG_BATCH_WINDOW", defaultWorkerLogBatchWindow)
+	if err != nil {
+		log.Fatalf("invalid WORKER_LOG_BATCH_WINDOW: %v", err)
+	}
+	if logBatchWindow <= 0 {
+		log.Fatalf("WORKER_LOG_BATCH_WINDOW must be > 0, got %s", logBatchWindow)
+	}
 	workerLeaseTTL, err := int64EnvOrDefault("WORKER_LEASE_TTL", discovery.DefaultLeaseTTLSeconds)
 	if err != nil {
 		log.Fatalf("invalid WORKER_LEASE_TTL: %v", err)
@@ -131,6 +170,7 @@ func main() {
 
 	cfg := config{
 		WorkerGRPCAddr:        envOrDefault("WORKER_GRPC_ADDR", ":50051"),
+		WorkerHTTPAddr:        envOrDefault("WORKER_HTTP_ADDR", defaultWorkerHTTPAddr),
 		WorkerAdvertiseAddr:   envOrDefault("WORKER_ADVERTISE_ADDR", envOrDefault("WORKER_GRPC_ADDR", ":50051")),
 		MasterGRPCAddrs:       parseMasterGRPCAddrs(envOrDefault("MASTER_GRPC_ADDRS", envOrDefault("MASTER_GRPC_ADDR", "master:50052"))),
 		WorkerID:              envOrDefault("WORKER_ID", "worker-1"),
@@ -144,6 +184,16 @@ func main() {
 		HeartbeatInterval:     heartbeatInterval,
 		CompletedStateTTL:     completedStateTTL,
 		KillGracePeriod:       killGracePeriod,
+		LogBatcher: logBatcherConfig{
+			URI:            envOrDefault("WORKER_LOG_MONGO_URI", defaultMongoURI),
+			Database:       envOrDefault("WORKER_LOG_MONGO_DATABASE", defaultMongoDatabase),
+			Collection:     envOrDefault("WORKER_LOG_MONGO_COLLECTION", defaultMongoCollection),
+			ConnectTimeout: logMongoConnectTimeout,
+			WriteTimeout:   logMongoWriteTimeout,
+			BufferSize:     logBufferSize,
+			BatchSize:      logBatchSize,
+			BatchWindow:    logBatchWindow,
+		},
 	}
 	if len(cfg.EtcdEndpoints) == 0 {
 		log.Fatalf("no ETCD_ENDPOINTS configured")
@@ -163,12 +213,21 @@ func main() {
 	}
 	defer etcdClient.Close()
 
+	metrics := newWorkerMetrics()
+	logBatcher, err := newLogBatcher(context.Background(), cfg.LogBatcher, logger, metrics)
+	if err != nil {
+		logger.Fatalf("create mongo log batcher failed: %v", err)
+	}
+	defer logBatcher.Close()
+
 	srv := &workerServer{
-		cfg:     cfg,
-		logger:  logger,
-		etcd:    etcdClient,
-		running: make(map[int64]*runningExecution),
-		done:    make(map[int64]completedExecution),
+		cfg:        cfg,
+		logger:     logger,
+		etcd:       etcdClient,
+		metrics:    metrics,
+		logBatcher: logBatcher,
+		running:    make(map[int64]*runningExecution),
+		done:       make(map[int64]completedExecution),
 	}
 
 	lis, err := net.Listen("tcp", cfg.WorkerGRPCAddr)
@@ -180,10 +239,20 @@ func main() {
 	scheduler.RegisterWorkerServer(grpcServer, srv)
 
 	go srv.runRegistrationLoop(context.Background())
+	errCh := make(chan error, 2)
+
+	go func() {
+		errCh <- grpcServer.Serve(lis)
+	}()
+
+	go func() {
+		errCh <- srv.serveHTTP(cfg.WorkerHTTPAddr)
+	}()
 
 	logger.Printf(
-		"worker started: grpc=%s advertise=%s masters=%v etcd=%v leader_key=%s lease_ttl=%d report_timeout=%s heartbeat_interval=%s completed_ttl=%s kill_grace=%s",
+		"worker started: grpc=%s http=%s advertise=%s masters=%v etcd=%v leader_key=%s lease_ttl=%d report_timeout=%s heartbeat_interval=%s completed_ttl=%s kill_grace=%s mongo_uri=%s mongo_db=%s mongo_collection=%s log_buffer=%d log_batch=%d log_window=%s",
 		cfg.WorkerGRPCAddr,
+		cfg.WorkerHTTPAddr,
 		cfg.WorkerAdvertiseAddr,
 		cfg.MasterGRPCAddrs,
 		cfg.EtcdEndpoints,
@@ -193,9 +262,15 @@ func main() {
 		cfg.HeartbeatInterval,
 		cfg.CompletedStateTTL,
 		cfg.KillGracePeriod,
+		cfg.LogBatcher.URI,
+		cfg.LogBatcher.Database,
+		cfg.LogBatcher.Collection,
+		cfg.LogBatcher.BufferSize,
+		cfg.LogBatcher.BatchSize,
+		cfg.LogBatcher.BatchWindow,
 	)
-	if err := grpcServer.Serve(lis); err != nil {
-		logger.Fatalf("worker grpc serve failed: %v", err)
+	if err := <-errCh; err != nil {
+		logger.Fatalf("server exited: %v", err)
 	}
 }
 
@@ -345,6 +420,7 @@ func (s *workerServer) RunJob(ctx context.Context, req *scheduler.RunJobRequest)
 		attempt:   req.GetAttempt(),
 		startedAt: time.Now().UTC(),
 	}
+	s.metrics.setRunningJobs(len(s.running))
 	s.mu.Unlock()
 
 	go s.execute(runCtx, req)
@@ -391,19 +467,27 @@ func (s *workerServer) execute(runCtx context.Context, req *scheduler.RunJobRequ
 	}
 	defer logFile.Close()
 
-	_, _ = fmt.Fprintf(logFile, "[%s] start worker=%s attempt=%d command=%s args=%v\n", startedAt.Format(time.RFC3339Nano), s.cfg.WorkerID, req.GetAttempt(), req.GetCommand(), req.GetArgs())
+	logSink := newInstanceLogSink(logFile, s.logBatcher, instanceLogMeta{
+		WorkerID:      s.cfg.WorkerID,
+		JobID:         req.GetJobId(),
+		JobInstanceID: instanceID,
+		Attempt:       req.GetAttempt(),
+	})
+	defer logSink.Flush()
+
+	_, _ = fmt.Fprintf(logSink.System(), "[%s] start worker=%s attempt=%d command=%s args=%v\n", startedAt.Format(time.RFC3339Nano), s.cfg.WorkerID, req.GetAttempt(), req.GetCommand(), req.GetArgs())
 
 	cmd := exec.CommandContext(runCtx, req.GetCommand(), req.GetArgs()...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = append(os.Environ(), flattenEnv(req.GetEnv())...)
-	cmd.Stdout = io.MultiWriter(logFile)
-	cmd.Stderr = io.MultiWriter(logFile)
-	cmd.Cancel = buildCommandCanceler(runCtx, cmd, logFile, s.cfg.KillGracePeriod)
+	cmd.Stdout = logSink.Stdout()
+	cmd.Stderr = logSink.Stderr()
+	cmd.Cancel = buildCommandCanceler(runCtx, cmd, logSink.System(), s.cfg.KillGracePeriod)
 
 	if err := cmd.Start(); err != nil {
 		finished := time.Now().UTC()
 		s.logger.Printf("start command failed: instance_id=%d err=%v", instanceID, err)
-		_, _ = fmt.Fprintf(logFile, "[%s] start failed: %v\n", finished.Format(time.RFC3339Nano), err)
+		_, _ = fmt.Fprintf(logSink.System(), "[%s] start failed: %v\n", finished.Format(time.RFC3339Nano), err)
 		finalAttempt := s.currentAttempt(instanceID, req.GetAttempt())
 		s.reportJobStatus(req.GetJobId(), instanceID, finalAttempt, scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_FAILED, -1, err.Error(), startedAt, finished)
 		s.markCompleted(instanceID, finalAttempt, scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_FAILED, -1, err.Error(), startedAt, finished)
@@ -438,7 +522,8 @@ func (s *workerServer) execute(runCtx context.Context, req *scheduler.RunJobRequ
 	}
 
 	finalAttempt := s.currentAttempt(instanceID, req.GetAttempt())
-	_, _ = fmt.Fprintf(logFile, "[%s] finished attempt=%d status=%s exit_code=%d error=%s\n", finishedAt.Format(time.RFC3339Nano), finalAttempt, status.String(), exitCode, errMsg)
+	_, _ = fmt.Fprintf(logSink.System(), "[%s] finished attempt=%d status=%s exit_code=%d error=%s\n", finishedAt.Format(time.RFC3339Nano), finalAttempt, status.String(), exitCode, errMsg)
+	logSink.Flush()
 	s.reportJobStatus(req.GetJobId(), instanceID, finalAttempt, status, exitCode, errMsg, startedAt, finishedAt)
 	s.markCompleted(instanceID, finalAttempt, status, exitCode, errMsg, startedAt, finishedAt)
 }
@@ -592,6 +677,7 @@ func (s *workerServer) markCompleted(
 			execution.cleanup()
 		}
 		delete(s.running, instanceID)
+		s.metrics.setRunningJobs(len(s.running))
 	}
 	s.done[instanceID] = completedExecution{
 		attempt:      attempt,
@@ -803,6 +889,14 @@ func int64EnvOrDefault(key string, defaultValue int64) (int64, error) {
 		return defaultValue, nil
 	}
 	return strconv.ParseInt(value, 10, 64)
+}
+
+func intEnvOrDefault(key string, defaultValue int) (int, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue, nil
+	}
+	return strconv.Atoi(value)
 }
 
 func parseMasterGRPCAddrs(raw string) []string {
