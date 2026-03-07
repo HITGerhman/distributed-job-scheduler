@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	scheduler "github.com/HITGerhman/distributed-job-scheduler/api/proto"
@@ -28,6 +29,12 @@ const (
 	defaultMasterReportTimeout     = 12 * time.Second
 	defaultWorkerHeartbeatInterval = 2 * time.Second
 	defaultCompletedStateTTL       = 30 * time.Minute
+	defaultKillGracePeriod         = 3 * time.Second
+)
+
+var (
+	errManualKillRequested = errors.New("manual kill requested")
+	errExecutionTimedOut   = errors.New("execution timeout exceeded")
 )
 
 type config struct {
@@ -44,6 +51,7 @@ type config struct {
 	MasterReportTimeout   time.Duration
 	HeartbeatInterval     time.Duration
 	CompletedStateTTL     time.Duration
+	KillGracePeriod       time.Duration
 }
 
 type workerServer struct {
@@ -57,9 +65,11 @@ type workerServer struct {
 }
 
 type runningExecution struct {
-	cancel    context.CancelFunc
+	cancel    context.CancelCauseFunc
+	cleanup   func()
 	attempt   uint32
 	startedAt time.Time
+	stopOnce  sync.Once
 }
 
 type completedExecution struct {
@@ -70,6 +80,12 @@ type completedExecution struct {
 	startedAt    time.Time
 	finishedAt   time.Time
 	recordedAt   time.Time
+}
+
+func (e *runningExecution) requestStop(cause error) {
+	e.stopOnce.Do(func() {
+		e.cancel(cause)
+	})
 }
 
 func main() {
@@ -98,6 +114,13 @@ func main() {
 	if completedStateTTL <= 0 {
 		log.Fatalf("WORKER_COMPLETED_TTL must be > 0, got %s", completedStateTTL)
 	}
+	killGracePeriod, err := durationEnvOrDefault("WORKER_KILL_GRACE_PERIOD", defaultKillGracePeriod)
+	if err != nil {
+		log.Fatalf("invalid WORKER_KILL_GRACE_PERIOD: %v", err)
+	}
+	if killGracePeriod <= 0 {
+		log.Fatalf("WORKER_KILL_GRACE_PERIOD must be > 0, got %s", killGracePeriod)
+	}
 	workerLeaseTTL, err := int64EnvOrDefault("WORKER_LEASE_TTL", discovery.DefaultLeaseTTLSeconds)
 	if err != nil {
 		log.Fatalf("invalid WORKER_LEASE_TTL: %v", err)
@@ -120,6 +143,7 @@ func main() {
 		MasterReportTimeout:   masterReportTimeout,
 		HeartbeatInterval:     heartbeatInterval,
 		CompletedStateTTL:     completedStateTTL,
+		KillGracePeriod:       killGracePeriod,
 	}
 	if len(cfg.EtcdEndpoints) == 0 {
 		log.Fatalf("no ETCD_ENDPOINTS configured")
@@ -158,7 +182,7 @@ func main() {
 	go srv.runRegistrationLoop(context.Background())
 
 	logger.Printf(
-		"worker started: grpc=%s advertise=%s masters=%v etcd=%v leader_key=%s lease_ttl=%d report_timeout=%s heartbeat_interval=%s completed_ttl=%s",
+		"worker started: grpc=%s advertise=%s masters=%v etcd=%v leader_key=%s lease_ttl=%d report_timeout=%s heartbeat_interval=%s completed_ttl=%s kill_grace=%s",
 		cfg.WorkerGRPCAddr,
 		cfg.WorkerAdvertiseAddr,
 		cfg.MasterGRPCAddrs,
@@ -168,6 +192,7 @@ func main() {
 		cfg.MasterReportTimeout,
 		cfg.HeartbeatInterval,
 		cfg.CompletedStateTTL,
+		cfg.KillGracePeriod,
 	)
 	if err := grpcServer.Serve(lis); err != nil {
 		logger.Fatalf("worker grpc serve failed: %v", err)
@@ -301,21 +326,28 @@ func (s *workerServer) RunJob(ctx context.Context, req *scheduler.RunJobRequest)
 		delete(s.done, instanceID)
 	}
 
-	baseCtx := context.Background()
-	var cancel context.CancelFunc
+	timeoutCtx := context.Background()
+	cancelTimeout := func() {}
 	if req.GetTimeoutSeconds() > 0 {
-		baseCtx, cancel = context.WithTimeout(baseCtx, time.Duration(req.GetTimeoutSeconds())*time.Second)
-	} else {
-		baseCtx, cancel = context.WithCancel(baseCtx)
+		timeoutCtx, cancelTimeout = context.WithTimeoutCause(
+			timeoutCtx,
+			time.Duration(req.GetTimeoutSeconds())*time.Second,
+			errExecutionTimedOut,
+		)
 	}
+	runCtx, cancelRun := context.WithCancelCause(timeoutCtx)
 	s.running[instanceID] = &runningExecution{
-		cancel:    cancel,
+		cancel: cancelRun,
+		cleanup: func() {
+			cancelRun(nil)
+			cancelTimeout()
+		},
 		attempt:   req.GetAttempt(),
 		startedAt: time.Now().UTC(),
 	}
 	s.mu.Unlock()
 
-	go s.execute(baseCtx, req)
+	go s.execute(runCtx, req)
 
 	s.logger.Printf("accept job: instance_id=%d attempt=%d command=%s args=%v", instanceID, req.GetAttempt(), req.GetCommand(), req.GetArgs())
 	return &scheduler.RunJobResponse{Accepted: true, Message: "accepted"}, nil
@@ -334,8 +366,9 @@ func (s *workerServer) KillJob(ctx context.Context, req *scheduler.KillJobReques
 		return &scheduler.KillJobResponse{Accepted: false, Message: "job instance not running"}, nil
 	}
 
-	execution.cancel()
-	s.logger.Printf("kill requested: instance_id=%d reason=%s", instanceID, req.GetReason())
+	reason := strings.TrimSpace(req.GetReason())
+	execution.requestStop(manualKillCause(reason))
+	s.logger.Printf("kill requested: instance_id=%d reason=%s", instanceID, reason)
 	return &scheduler.KillJobResponse{Accepted: true, Message: "kill signal sent"}, nil
 }
 
@@ -361,9 +394,11 @@ func (s *workerServer) execute(runCtx context.Context, req *scheduler.RunJobRequ
 	_, _ = fmt.Fprintf(logFile, "[%s] start worker=%s attempt=%d command=%s args=%v\n", startedAt.Format(time.RFC3339Nano), s.cfg.WorkerID, req.GetAttempt(), req.GetCommand(), req.GetArgs())
 
 	cmd := exec.CommandContext(runCtx, req.GetCommand(), req.GetArgs()...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = append(os.Environ(), flattenEnv(req.GetEnv())...)
 	cmd.Stdout = io.MultiWriter(logFile)
 	cmd.Stderr = io.MultiWriter(logFile)
+	cmd.Cancel = buildCommandCanceler(runCtx, cmd, logFile, s.cfg.KillGracePeriod)
 
 	if err := cmd.Start(); err != nil {
 		finished := time.Now().UTC()
@@ -386,9 +421,10 @@ func (s *workerServer) execute(runCtx context.Context, req *scheduler.RunJobRequ
 	errMsg := ""
 
 	if err != nil {
-		if errors.Is(runCtx.Err(), context.Canceled) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+		cause := context.Cause(runCtx)
+		if cause != nil && (errors.Is(cause, errManualKillRequested) || errors.Is(cause, errExecutionTimedOut) || errors.Is(runCtx.Err(), context.Canceled) || errors.Is(runCtx.Err(), context.DeadlineExceeded)) {
 			status = scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_KILLED
-			errMsg = runCtx.Err().Error()
+			errMsg = cause.Error()
 		} else {
 			status = scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_FAILED
 			errMsg = err.Error()
@@ -405,6 +441,91 @@ func (s *workerServer) execute(runCtx context.Context, req *scheduler.RunJobRequ
 	_, _ = fmt.Fprintf(logFile, "[%s] finished attempt=%d status=%s exit_code=%d error=%s\n", finishedAt.Format(time.RFC3339Nano), finalAttempt, status.String(), exitCode, errMsg)
 	s.reportJobStatus(req.GetJobId(), instanceID, finalAttempt, status, exitCode, errMsg, startedAt, finishedAt)
 	s.markCompleted(instanceID, finalAttempt, status, exitCode, errMsg, startedAt, finishedAt)
+}
+
+func buildCommandCanceler(runCtx context.Context, cmd *exec.Cmd, logWriter io.Writer, gracePeriod time.Duration) func() error {
+	return func() error {
+		if cmd.Process == nil || cmd.Process.Pid <= 0 {
+			return os.ErrProcessDone
+		}
+
+		processGroupID := cmd.Process.Pid
+		cause := context.Cause(runCtx)
+		if cause == nil {
+			cause = context.Canceled
+		}
+
+		now := time.Now().UTC()
+		_, _ = fmt.Fprintf(logWriter, "[%s] stop requested: pid=%d cause=%s\n", now.Format(time.RFC3339Nano), processGroupID, cause.Error())
+
+		if err := signalProcessGroup(processGroupID, syscall.SIGTERM); err != nil {
+			if errors.Is(err, os.ErrProcessDone) {
+				_, _ = fmt.Fprintf(logWriter, "[%s] stop skipped: process_group=%d already exited\n", time.Now().UTC().Format(time.RFC3339Nano), processGroupID)
+				return os.ErrProcessDone
+			}
+			_, _ = fmt.Fprintf(logWriter, "[%s] SIGTERM failed: process_group=%d err=%v\n", time.Now().UTC().Format(time.RFC3339Nano), processGroupID, err)
+			return err
+		}
+		_, _ = fmt.Fprintf(logWriter, "[%s] SIGTERM sent: process_group=%d grace=%s\n", time.Now().UTC().Format(time.RFC3339Nano), processGroupID, gracePeriod)
+
+		deadline := time.Now().Add(gracePeriod)
+		for processGroupAlive(processGroupID) && time.Now().Before(deadline) {
+			sleepFor := 100 * time.Millisecond
+			if remaining := time.Until(deadline); remaining < sleepFor {
+				sleepFor = remaining
+			}
+			if sleepFor <= 0 {
+				break
+			}
+			time.Sleep(sleepFor)
+		}
+
+		if !processGroupAlive(processGroupID) {
+			_, _ = fmt.Fprintf(logWriter, "[%s] process group exited after SIGTERM: process_group=%d\n", time.Now().UTC().Format(time.RFC3339Nano), processGroupID)
+			return nil
+		}
+
+		if err := signalProcessGroup(processGroupID, syscall.SIGKILL); err != nil {
+			if errors.Is(err, os.ErrProcessDone) {
+				_, _ = fmt.Fprintf(logWriter, "[%s] process group exited before SIGKILL: process_group=%d\n", time.Now().UTC().Format(time.RFC3339Nano), processGroupID)
+				return nil
+			}
+			_, _ = fmt.Fprintf(logWriter, "[%s] SIGKILL failed: process_group=%d err=%v\n", time.Now().UTC().Format(time.RFC3339Nano), processGroupID, err)
+			return err
+		}
+		_, _ = fmt.Fprintf(logWriter, "[%s] SIGKILL sent: process_group=%d\n", time.Now().UTC().Format(time.RFC3339Nano), processGroupID)
+		return nil
+	}
+}
+
+func signalProcessGroup(processGroupID int, signal syscall.Signal) error {
+	if processGroupID <= 0 {
+		return os.ErrProcessDone
+	}
+	err := syscall.Kill(-processGroupID, signal)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, syscall.ESRCH) {
+		return os.ErrProcessDone
+	}
+	return err
+}
+
+func processGroupAlive(processGroupID int) bool {
+	if processGroupID <= 0 {
+		return false
+	}
+	err := syscall.Kill(-processGroupID, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func manualKillCause(reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return errManualKillRequested
+	}
+	return fmt.Errorf("%w: %s", errManualKillRequested, reason)
 }
 
 func (s *workerServer) runHeartbeatLoop(runCtx context.Context, jobID, instanceID int64, startedAt time.Time) {
@@ -467,7 +588,9 @@ func (s *workerServer) markCompleted(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if execution, ok := s.running[instanceID]; ok {
-		execution.cancel()
+		if execution.cleanup != nil {
+			execution.cleanup()
+		}
 		delete(s.running, instanceID)
 	}
 	s.done[instanceID] = completedExecution{

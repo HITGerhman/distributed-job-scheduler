@@ -32,6 +32,7 @@ The following transitions must be rejected as invalid state moves:
 - Worker may send repeated `RUNNING` heartbeats for the same attempt.
 - Master validates transition legality before persisting final state.
 - Master may move a failed/timed-out attempt back to `PENDING` internally to schedule a retry.
+- `KILLED` is terminal and must not be retried automatically.
 
 ## Persistence Mapping
 

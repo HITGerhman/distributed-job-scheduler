@@ -141,6 +141,7 @@ services:
       MASTER_REPORT_TIMEOUT: 12s
       WORKER_HEARTBEAT_INTERVAL: 2s
       WORKER_COMPLETED_TTL: 30m
+      WORKER_KILL_GRACE_PERIOD: 3s
     depends_on:
       etcd:
         condition: service_healthy

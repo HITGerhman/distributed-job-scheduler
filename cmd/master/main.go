@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -97,6 +98,16 @@ type createJobResponse struct {
 
 type triggerJobResponse struct {
 	JobInstanceID int64  `json:"job_instance_id"`
+	Message       string `json:"message"`
+}
+
+type killJobInstanceRequest struct {
+	Reason string `json:"reason"`
+}
+
+type killJobInstanceResponse struct {
+	JobInstanceID int64  `json:"job_instance_id"`
+	Status        string `json:"status"`
 	Message       string `json:"message"`
 }
 
@@ -286,7 +297,7 @@ func (s *masterServer) serveHTTP(addr string) error {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/jobs", s.handleCreateJob)
 	mux.HandleFunc("/jobs/", s.handleTriggerJob)
-	mux.HandleFunc("/job-instances/", s.handleGetJobInstance)
+	mux.HandleFunc("/job-instances/", s.handleJobInstance)
 
 	httpServer := &http.Server{
 		Addr:              addr,
@@ -476,13 +487,9 @@ func (s *masterServer) handleTriggerJob(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-func (s *masterServer) handleGetJobInstance(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+func (s *masterServer) handleJobInstance(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) != 2 || parts[0] != "job-instances" {
+	if len(parts) < 2 || parts[0] != "job-instances" {
 		http.NotFound(w, r)
 		return
 	}
@@ -492,6 +499,20 @@ func (s *masterServer) handleGetJobInstance(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "invalid job instance id", http.StatusBadRequest)
 		return
 	}
+
+	switch {
+	case len(parts) == 2 && r.Method == http.MethodGet:
+		s.handleGetJobInstance(w, r, instanceID)
+	case len(parts) == 3 && parts[2] == "kill" && r.Method == http.MethodPost:
+		s.handleKillJobInstance(w, r, instanceID)
+	case len(parts) == 2 || (len(parts) == 3 && parts[2] == "kill"):
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *masterServer) handleGetJobInstance(w http.ResponseWriter, r *http.Request, instanceID int64) {
 
 	instance, err := s.getJobInstanceByID(r.Context(), instanceID)
 	if err != nil {
@@ -534,6 +555,34 @@ func (s *masterServer) handleGetJobInstance(w http.ResponseWriter, r *http.Reque
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *masterServer) handleKillJobInstance(w http.ResponseWriter, r *http.Request, instanceID int64) {
+	var req killJobInstanceRequest
+	if r.Body != nil && r.Body != http.NoBody {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			http.Error(w, "invalid json body", http.StatusBadRequest)
+			return
+		}
+	}
+
+	instance, message, err := s.killJobInstance(r.Context(), instanceID, req.Reason)
+	if err != nil {
+		statusCode := http.StatusBadGateway
+		if errors.Is(err, sql.ErrNoRows) {
+			statusCode = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "already terminal") {
+			statusCode = http.StatusConflict
+		}
+		http.Error(w, fmt.Sprintf("kill instance failed: %v", err), statusCode)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, killJobInstanceResponse{
+		JobInstanceID: instance.ID,
+		Status:        instance.Status,
+		Message:       message,
+	})
 }
 
 func (s *masterServer) loadJob(ctx context.Context, jobID int64) (jobRecord, error) {
@@ -860,6 +909,50 @@ func (s *masterServer) dispatchPendingInstance(
 	return s.getJobInstanceByID(ctx, claimed.ID)
 }
 
+func (s *masterServer) killJobInstance(ctx context.Context, instanceID int64, reason string) (jobInstanceRecord, string, error) {
+	instance, err := s.getJobInstanceByID(ctx, instanceID)
+	if err != nil {
+		return jobInstanceRecord{}, "", err
+	}
+
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "manual kill requested"
+	}
+	if isTerminalStatus(instance.Status) {
+		return instance, "", fmt.Errorf("job instance %d already terminal: %s", instance.ID, instance.Status)
+	}
+
+	if instance.Status == "PENDING" && (!instance.WorkerID.Valid || strings.TrimSpace(instance.WorkerID.String) == "") {
+		if err := s.markInstanceKilled(ctx, instance, reason, time.Now().UTC()); err != nil {
+			return jobInstanceRecord{}, "", err
+		}
+		killed, err := s.getJobInstanceByID(ctx, instance.ID)
+		if err != nil {
+			return jobInstanceRecord{}, "", err
+		}
+		return killed, "killed before dispatch", nil
+	}
+
+	if !instance.WorkerID.Valid || strings.TrimSpace(instance.WorkerID.String) == "" {
+		return instance, "", fmt.Errorf("job instance %d has no assigned worker", instance.ID)
+	}
+
+	worker, err := s.getWorkerByID(instance.WorkerID.String)
+	if err != nil {
+		return instance, "", err
+	}
+	if err := s.dispatchKillJob(ctx, instance, worker, reason); err != nil {
+		return instance, "", err
+	}
+
+	updated, err := s.getJobInstanceByID(ctx, instance.ID)
+	if err != nil {
+		return jobInstanceRecord{}, "", err
+	}
+	return updated, "kill dispatched", nil
+}
+
 func (s *masterServer) getJobInstanceBySlot(ctx context.Context, jobID int64, scheduledAt time.Time) (jobInstanceRecord, error) {
 	return s.scanJobInstance(
 		s.db.QueryRowContext(
@@ -1132,6 +1225,40 @@ func (s *masterServer) markInstanceFailed(
 		"instance failed permanently: instance_id=%d attempt=%d/%d reason=%s",
 		instance.ID,
 		attempt,
+		instance.MaxAttempts,
+		reason,
+	)
+	return nil
+}
+
+func (s *masterServer) markInstanceKilled(
+	ctx context.Context,
+	instance jobInstanceRecord,
+	reason string,
+	killedAt time.Time,
+) error {
+	res, err := s.db.ExecContext(
+		ctx,
+		`UPDATE job_instances
+		 SET status='KILLED', finished_at=?, exit_code=COALESCE(exit_code, -1),
+		     error_message=?, next_retry_at=NULL, last_heartbeat_at=NULL, updated_at=CURRENT_TIMESTAMP
+		 WHERE id=? AND status='PENDING'`,
+		killedAt.UTC(),
+		reason,
+		instance.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("mark instance killed: %w", err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err == nil && rowsAffected == 0 {
+		return fmt.Errorf("mark instance killed: no pending row updated")
+	}
+
+	s.logger.Printf(
+		"instance killed before dispatch: instance_id=%d attempt=%d/%d reason=%s",
+		instance.ID,
+		instance.Attempt,
 		instance.MaxAttempts,
 		reason,
 	)
@@ -1502,6 +1629,22 @@ func (s *masterServer) selectWorker(preferredWorkerID string) (discovery.WorkerR
 	return discovery.WorkerRegistration{}, fmt.Errorf("no workers available")
 }
 
+func (s *masterServer) getWorkerByID(workerID string) (discovery.WorkerRegistration, error) {
+	workerID = strings.TrimSpace(workerID)
+	if workerID == "" {
+		return discovery.WorkerRegistration{}, fmt.Errorf("worker id is required")
+	}
+
+	s.workersMu.RLock()
+	defer s.workersMu.RUnlock()
+
+	worker, ok := s.workers[workerID]
+	if !ok {
+		return discovery.WorkerRegistration{}, fmt.Errorf("worker %s not available", workerID)
+	}
+	return worker, nil
+}
+
 func (s *masterServer) workerCount() int {
 	s.workersMu.RLock()
 	defer s.workersMu.RUnlock()
@@ -1539,6 +1682,44 @@ func (s *masterServer) dispatchRunJob(parent context.Context, req *scheduler.Run
 		return discovery.WorkerRegistration{}, fmt.Errorf("worker %s(%s) rejected run job: %s", worker.ID, worker.Addr, resp.GetMessage())
 	}
 	return worker, nil
+}
+
+func (s *masterServer) dispatchKillJob(parent context.Context, instance jobInstanceRecord, worker discovery.WorkerRegistration, reason string) error {
+	ctx, cancel := context.WithTimeout(parent, 6*time.Second)
+	defer cancel()
+
+	conn, err := grpc.DialContext(
+		ctx,
+		worker.Addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		return fmt.Errorf("dial worker %s(%s) failed: %w", worker.ID, worker.Addr, err)
+	}
+	defer conn.Close()
+
+	client := scheduler.NewWorkerClient(conn)
+	resp, err := client.KillJob(ctx, &scheduler.KillJobRequest{
+		JobInstanceId: instance.ID,
+		Reason:        reason,
+	})
+	if err != nil {
+		return fmt.Errorf("worker %s(%s) KillJob failed: %w", worker.ID, worker.Addr, err)
+	}
+	if !resp.GetAccepted() {
+		return fmt.Errorf("worker %s(%s) rejected kill job: %s", worker.ID, worker.Addr, resp.GetMessage())
+	}
+
+	s.logger.Printf(
+		"dispatch kill: instance_id=%d attempt=%d worker_id=%s worker_addr=%s reason=%s",
+		instance.ID,
+		instance.Attempt,
+		worker.ID,
+		worker.Addr,
+		reason,
+	)
+	return nil
 }
 
 func (s *masterServer) ReportResult(ctx context.Context, req *scheduler.ReportResultRequest) (*scheduler.ReportResultResponse, error) {
@@ -1618,7 +1799,7 @@ func (s *masterServer) ReportResult(ctx context.Context, req *scheduler.ReportRe
 		if err == nil && rowsAffected == 0 {
 			return &scheduler.ReportResultResponse{Accepted: true, Message: "stale success report ignored"}, nil
 		}
-	default:
+	case "FAILED":
 		reason := strings.TrimSpace(req.GetErrorMessage())
 		if reason == "" {
 			reason = nextStatus
@@ -1661,6 +1842,34 @@ func (s *masterServer) ReportResult(ctx context.Context, req *scheduler.ReportRe
 		if err == nil && rowsAffected == 0 {
 			return &scheduler.ReportResultResponse{Accepted: true, Message: "stale terminal report ignored"}, nil
 		}
+	case "KILLED":
+		reason := strings.TrimSpace(req.GetErrorMessage())
+		if reason == "" {
+			reason = nextStatus
+		}
+		res, execErr := s.db.ExecContext(
+			ctx,
+			`UPDATE job_instances
+			 SET status='KILLED', worker_id=?, started_at=?, finished_at=?, exit_code=?, error_message=?, last_heartbeat_at=?, next_retry_at=NULL, updated_at=CURRENT_TIMESTAMP
+			 WHERE id=? AND attempt=? AND status IN ('PENDING', 'RUNNING')`,
+			workerID,
+			startedAt,
+			coalesceOptionalTime(req.GetFinishedAt(), instance.FinishedAt),
+			req.GetExitCode(),
+			reason,
+			now,
+			instance.ID,
+			instance.Attempt,
+		)
+		if execErr != nil {
+			return &scheduler.ReportResultResponse{Accepted: false, Message: fmt.Sprintf("update killed result failed: %v", execErr)}, nil
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err == nil && rowsAffected == 0 {
+			return &scheduler.ReportResultResponse{Accepted: true, Message: "stale killed report ignored"}, nil
+		}
+	default:
+		return &scheduler.ReportResultResponse{Accepted: false, Message: fmt.Sprintf("unsupported status transition target: %s", nextStatus)}, nil
 	}
 
 	s.logger.Printf(
@@ -1704,6 +1913,10 @@ func isValidTransition(from, to string) bool {
 	default:
 		return false
 	}
+}
+
+func isTerminalStatus(status string) bool {
+	return status == "SUCCESS" || status == "FAILED" || status == "KILLED"
 }
 
 func coalesceOptionalTime(ts *timestamppb.Timestamp, fallback sql.NullTime) interface{} {

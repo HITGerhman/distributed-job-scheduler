@@ -34,6 +34,10 @@ type createJobRequest struct {
 	HeartbeatTimeoutSeconds *uint32  `json:"heartbeat_timeout_seconds,omitempty"`
 }
 
+type killInstanceRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -54,6 +58,11 @@ func main() {
 	case "get-instance":
 		if err := runGetInstance(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "get-instance failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "kill-instance":
+		if err := runKillInstance(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "kill-instance failed: %v\n", err)
 			os.Exit(1)
 		}
 	default:
@@ -154,6 +163,27 @@ func runGetInstance(args []string) error {
 	return nil
 }
 
+func runKillInstance(args []string) error {
+	fs := flag.NewFlagSet("kill-instance", flag.ContinueOnError)
+	baseURL := fs.String("base-url", envOrDefault("MASTER_HTTP_BASE", "http://127.0.0.1:8080"), "master http base url")
+	instanceID := fs.Int64("id", 0, "job instance id")
+	reason := fs.String("reason", "", "kill reason")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *instanceID <= 0 {
+		return fmt.Errorf("--id must be > 0")
+	}
+
+	reqBody := killInstanceRequest{Reason: *reason}
+	respBody, err := httpJSON(http.MethodPost, fmt.Sprintf("%s/job-instances/%d/kill", *baseURL, *instanceID), reqBody)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(respBody))
+	return nil
+}
+
 func httpJSON(method, url string, payload interface{}) ([]byte, error) {
 	var body io.Reader
 	if payload != nil {
@@ -193,6 +223,7 @@ func printUsage() {
 	fmt.Println("  ctl create-job --name demo --command /bin/sh --arg -c --arg 'echo hello' [--cron @manual] [--timeout 5] [--max-retries 2] [--retry-backoff 2] [--max-retry-backoff 30] [--heartbeat-timeout 15]")
 	fmt.Println("  ctl trigger --job-id 1")
 	fmt.Println("  ctl get-instance --id 1")
+	fmt.Println("  ctl kill-instance --id 1 [--reason 'manual stop']")
 }
 
 func envOrDefault(key, defaultValue string) string {
