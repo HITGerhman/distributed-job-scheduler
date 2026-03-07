@@ -102,15 +102,15 @@ func TestSelectWorkerRoundRobin(t *testing.T) {
 		workerOrder: []string{"worker-a", "worker-b"},
 	}
 
-	first, err := srv.selectWorker()
+	first, err := srv.selectWorker("")
 	if err != nil {
 		t.Fatalf("selectWorker() error = %v", err)
 	}
-	second, err := srv.selectWorker()
+	second, err := srv.selectWorker("")
 	if err != nil {
 		t.Fatalf("selectWorker() second error = %v", err)
 	}
-	third, err := srv.selectWorker()
+	third, err := srv.selectWorker("")
 	if err != nil {
 		t.Fatalf("selectWorker() third error = %v", err)
 	}
@@ -150,5 +150,25 @@ func TestDefaultAdvertiseAddr(t *testing.T) {
 	}
 	if got := defaultAdvertiseAddr("master-3:8080", "master-x"); got != "master-3:8080" {
 		t.Fatalf("defaultAdvertiseAddr(master-3:8080) = %q, want %q", got, "master-3:8080")
+	}
+}
+
+func TestComputeRetryDelay(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{attempt: 1, want: 2 * time.Second},
+		{attempt: 2, want: 4 * time.Second},
+		{attempt: 3, want: 8 * time.Second},
+		{attempt: 6, want: 30 * time.Second},
+	}
+
+	for _, tt := range tests {
+		if got := computeRetryDelay(tt.attempt, 2, 30); got != tt.want {
+			t.Fatalf("computeRetryDelay(%d) = %s, want %s", tt.attempt, got, tt.want)
+		}
 	}
 }

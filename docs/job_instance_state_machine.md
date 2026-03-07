@@ -11,6 +11,8 @@
 ## Allowed Transitions
 
 - `PENDING -> RUNNING`
+- `PENDING -> SUCCESS`
+- `PENDING -> FAILED`
 - `PENDING -> KILLED`
 - `RUNNING -> SUCCESS`
 - `RUNNING -> FAILED`
@@ -21,14 +23,15 @@
 The following transitions must be rejected as invalid state moves:
 
 - Any transition from terminal states (`SUCCESS`, `FAILED`, `KILLED`) to another state.
-- `PENDING -> SUCCESS` / `PENDING -> FAILED` (must run first).
 - `RUNNING -> PENDING`.
 
 ## Ownership
 
 - Master is responsible for creating `PENDING` instances.
 - Worker execution updates `RUNNING` and sends `ReportResult`.
+- Worker may send repeated `RUNNING` heartbeats for the same attempt.
 - Master validates transition legality before persisting final state.
+- Master may move a failed/timed-out attempt back to `PENDING` internally to schedule a retry.
 
 ## Persistence Mapping
 

@@ -24,7 +24,11 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-const defaultMasterReportTimeout = 12 * time.Second
+const (
+	defaultMasterReportTimeout     = 12 * time.Second
+	defaultWorkerHeartbeatInterval = 2 * time.Second
+	defaultCompletedStateTTL       = 30 * time.Minute
+)
 
 type config struct {
 	WorkerGRPCAddr        string
@@ -38,6 +42,8 @@ type config struct {
 	WorkerLeaseTTL        int64
 	LeaderElectionKey     string
 	MasterReportTimeout   time.Duration
+	HeartbeatInterval     time.Duration
+	CompletedStateTTL     time.Duration
 }
 
 type workerServer struct {
@@ -46,7 +52,24 @@ type workerServer struct {
 	logger  *log.Logger
 	etcd    *clientv3.Client
 	mu      sync.Mutex
-	running map[int64]context.CancelFunc
+	running map[int64]*runningExecution
+	done    map[int64]completedExecution
+}
+
+type runningExecution struct {
+	cancel    context.CancelFunc
+	attempt   uint32
+	startedAt time.Time
+}
+
+type completedExecution struct {
+	attempt      uint32
+	status       scheduler.JobInstanceStatus
+	exitCode     int32
+	errorMessage string
+	startedAt    time.Time
+	finishedAt   time.Time
+	recordedAt   time.Time
 }
 
 func main() {
@@ -60,6 +83,20 @@ func main() {
 	}
 	if masterReportTimeout <= 0 {
 		log.Fatalf("MASTER_REPORT_TIMEOUT must be > 0, got %s", masterReportTimeout)
+	}
+	heartbeatInterval, err := durationEnvOrDefault("WORKER_HEARTBEAT_INTERVAL", defaultWorkerHeartbeatInterval)
+	if err != nil {
+		log.Fatalf("invalid WORKER_HEARTBEAT_INTERVAL: %v", err)
+	}
+	if heartbeatInterval <= 0 {
+		log.Fatalf("WORKER_HEARTBEAT_INTERVAL must be > 0, got %s", heartbeatInterval)
+	}
+	completedStateTTL, err := durationEnvOrDefault("WORKER_COMPLETED_TTL", defaultCompletedStateTTL)
+	if err != nil {
+		log.Fatalf("invalid WORKER_COMPLETED_TTL: %v", err)
+	}
+	if completedStateTTL <= 0 {
+		log.Fatalf("WORKER_COMPLETED_TTL must be > 0, got %s", completedStateTTL)
 	}
 	workerLeaseTTL, err := int64EnvOrDefault("WORKER_LEASE_TTL", discovery.DefaultLeaseTTLSeconds)
 	if err != nil {
@@ -81,6 +118,8 @@ func main() {
 		WorkerLeaseTTL:        workerLeaseTTL,
 		LeaderElectionKey:     election.NormalizeLeaderKey(envOrDefault("LEADER_ELECTION_KEY", election.DefaultLeaderKey)),
 		MasterReportTimeout:   masterReportTimeout,
+		HeartbeatInterval:     heartbeatInterval,
+		CompletedStateTTL:     completedStateTTL,
 	}
 	if len(cfg.EtcdEndpoints) == 0 {
 		log.Fatalf("no ETCD_ENDPOINTS configured")
@@ -104,7 +143,8 @@ func main() {
 		cfg:     cfg,
 		logger:  logger,
 		etcd:    etcdClient,
-		running: make(map[int64]context.CancelFunc),
+		running: make(map[int64]*runningExecution),
+		done:    make(map[int64]completedExecution),
 	}
 
 	lis, err := net.Listen("tcp", cfg.WorkerGRPCAddr)
@@ -118,7 +158,7 @@ func main() {
 	go srv.runRegistrationLoop(context.Background())
 
 	logger.Printf(
-		"worker started: grpc=%s advertise=%s masters=%v etcd=%v leader_key=%s lease_ttl=%d report_timeout=%s",
+		"worker started: grpc=%s advertise=%s masters=%v etcd=%v leader_key=%s lease_ttl=%d report_timeout=%s heartbeat_interval=%s completed_ttl=%s",
 		cfg.WorkerGRPCAddr,
 		cfg.WorkerAdvertiseAddr,
 		cfg.MasterGRPCAddrs,
@@ -126,6 +166,8 @@ func main() {
 		cfg.LeaderElectionKey,
 		cfg.WorkerLeaseTTL,
 		cfg.MasterReportTimeout,
+		cfg.HeartbeatInterval,
+		cfg.CompletedStateTTL,
 	)
 	if err := grpcServer.Serve(lis); err != nil {
 		logger.Fatalf("worker grpc serve failed: %v", err)
@@ -221,11 +263,42 @@ func (s *workerServer) RunJob(ctx context.Context, req *scheduler.RunJobRequest)
 	if instanceID <= 0 {
 		return &scheduler.RunJobResponse{Accepted: false, Message: "job_instance_id must be > 0"}, nil
 	}
+	if req.GetAttempt() == 0 {
+		return &scheduler.RunJobResponse{Accepted: false, Message: "attempt must be > 0"}, nil
+	}
 
 	s.mu.Lock()
-	if _, exists := s.running[instanceID]; exists {
+	s.pruneCompletedLocked(time.Now().UTC())
+	if execution, exists := s.running[instanceID]; exists {
+		if req.GetAttempt() > execution.attempt {
+			execution.attempt = req.GetAttempt()
+		}
+		attempt := execution.attempt
+		startedAt := execution.startedAt
 		s.mu.Unlock()
-		return &scheduler.RunJobResponse{Accepted: false, Message: "job instance already running"}, nil
+		go s.reportJobStatus(req.GetJobId(), instanceID, attempt, scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_RUNNING, 0, "", startedAt, time.Time{})
+		return &scheduler.RunJobResponse{Accepted: true, Message: "job instance already running"}, nil
+	}
+	if completed, exists := s.done[instanceID]; exists {
+		if completed.status == scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_SUCCESS || req.GetAttempt() <= completed.attempt {
+			if req.GetAttempt() > completed.attempt {
+				completed.attempt = req.GetAttempt()
+				s.done[instanceID] = completed
+			}
+			s.mu.Unlock()
+			go s.reportJobStatus(
+				req.GetJobId(),
+				instanceID,
+				completed.attempt,
+				completed.status,
+				completed.exitCode,
+				completed.errorMessage,
+				completed.startedAt,
+				completed.finishedAt,
+			)
+			return &scheduler.RunJobResponse{Accepted: true, Message: "job instance already completed"}, nil
+		}
+		delete(s.done, instanceID)
 	}
 
 	baseCtx := context.Background()
@@ -235,12 +308,16 @@ func (s *workerServer) RunJob(ctx context.Context, req *scheduler.RunJobRequest)
 	} else {
 		baseCtx, cancel = context.WithCancel(baseCtx)
 	}
-	s.running[instanceID] = cancel
+	s.running[instanceID] = &runningExecution{
+		cancel:    cancel,
+		attempt:   req.GetAttempt(),
+		startedAt: time.Now().UTC(),
+	}
 	s.mu.Unlock()
 
 	go s.execute(baseCtx, req)
 
-	s.logger.Printf("accept job: instance_id=%d command=%s args=%v", instanceID, req.GetCommand(), req.GetArgs())
+	s.logger.Printf("accept job: instance_id=%d attempt=%d command=%s args=%v", instanceID, req.GetAttempt(), req.GetCommand(), req.GetArgs())
 	return &scheduler.RunJobResponse{Accepted: true, Message: "accepted"}, nil
 }
 
@@ -251,32 +328,37 @@ func (s *workerServer) KillJob(ctx context.Context, req *scheduler.KillJobReques
 	}
 
 	s.mu.Lock()
-	cancel, ok := s.running[instanceID]
+	execution, ok := s.running[instanceID]
 	s.mu.Unlock()
 	if !ok {
 		return &scheduler.KillJobResponse{Accepted: false, Message: "job instance not running"}, nil
 	}
 
-	cancel()
+	execution.cancel()
 	s.logger.Printf("kill requested: instance_id=%d reason=%s", instanceID, req.GetReason())
 	return &scheduler.KillJobResponse{Accepted: true, Message: "kill signal sent"}, nil
 }
 
 func (s *workerServer) execute(runCtx context.Context, req *scheduler.RunJobRequest) {
 	instanceID := req.GetJobInstanceId()
-	defer s.unregister(instanceID)
+	startedAt, ok := s.runningStartedAt(instanceID)
+	if !ok {
+		startedAt = time.Now().UTC()
+	}
 
-	startedAt := time.Now().UTC()
 	logPath := filepath.Join(s.cfg.LogDir, fmt.Sprintf("job_%d_instance_%d.log", req.GetJobId(), instanceID))
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		s.logger.Printf("open log file failed: instance_id=%d err=%v", instanceID, err)
-		s.reportResult(req, scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_FAILED, -1, err.Error(), startedAt, time.Now().UTC())
+		finalAttempt := s.currentAttempt(instanceID, req.GetAttempt())
+		finishedAt := time.Now().UTC()
+		s.reportJobStatus(req.GetJobId(), instanceID, finalAttempt, scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_FAILED, -1, err.Error(), startedAt, finishedAt)
+		s.markCompleted(instanceID, finalAttempt, scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_FAILED, -1, err.Error(), startedAt, finishedAt)
 		return
 	}
 	defer logFile.Close()
 
-	_, _ = fmt.Fprintf(logFile, "[%s] start worker=%s command=%s args=%v\n", startedAt.Format(time.RFC3339Nano), s.cfg.WorkerID, req.GetCommand(), req.GetArgs())
+	_, _ = fmt.Fprintf(logFile, "[%s] start worker=%s attempt=%d command=%s args=%v\n", startedAt.Format(time.RFC3339Nano), s.cfg.WorkerID, req.GetAttempt(), req.GetCommand(), req.GetArgs())
 
 	cmd := exec.CommandContext(runCtx, req.GetCommand(), req.GetArgs()...)
 	cmd.Env = append(os.Environ(), flattenEnv(req.GetEnv())...)
@@ -287,11 +369,14 @@ func (s *workerServer) execute(runCtx context.Context, req *scheduler.RunJobRequ
 		finished := time.Now().UTC()
 		s.logger.Printf("start command failed: instance_id=%d err=%v", instanceID, err)
 		_, _ = fmt.Fprintf(logFile, "[%s] start failed: %v\n", finished.Format(time.RFC3339Nano), err)
-		s.reportResult(req, scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_FAILED, -1, err.Error(), startedAt, finished)
+		finalAttempt := s.currentAttempt(instanceID, req.GetAttempt())
+		s.reportJobStatus(req.GetJobId(), instanceID, finalAttempt, scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_FAILED, -1, err.Error(), startedAt, finished)
+		s.markCompleted(instanceID, finalAttempt, scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_FAILED, -1, err.Error(), startedAt, finished)
 		return
 	}
 
-	s.reportResult(req, scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_RUNNING, 0, "", startedAt, time.Time{})
+	go s.runHeartbeatLoop(runCtx, req.GetJobId(), instanceID, startedAt)
+	s.reportJobStatus(req.GetJobId(), instanceID, s.currentAttempt(instanceID, req.GetAttempt()), scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_RUNNING, 0, "", startedAt, time.Time{})
 
 	err = cmd.Wait()
 	finishedAt := time.Now().UTC()
@@ -316,21 +401,99 @@ func (s *workerServer) execute(runCtx context.Context, req *scheduler.RunJobRequ
 		}
 	}
 
-	_, _ = fmt.Fprintf(logFile, "[%s] finished status=%s exit_code=%d error=%s\n", finishedAt.Format(time.RFC3339Nano), status.String(), exitCode, errMsg)
-	s.reportResult(req, status, exitCode, errMsg, startedAt, finishedAt)
+	finalAttempt := s.currentAttempt(instanceID, req.GetAttempt())
+	_, _ = fmt.Fprintf(logFile, "[%s] finished attempt=%d status=%s exit_code=%d error=%s\n", finishedAt.Format(time.RFC3339Nano), finalAttempt, status.String(), exitCode, errMsg)
+	s.reportJobStatus(req.GetJobId(), instanceID, finalAttempt, status, exitCode, errMsg, startedAt, finishedAt)
+	s.markCompleted(instanceID, finalAttempt, status, exitCode, errMsg, startedAt, finishedAt)
 }
 
-func (s *workerServer) unregister(instanceID int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if cancel, ok := s.running[instanceID]; ok {
-		cancel()
-		delete(s.running, instanceID)
+func (s *workerServer) runHeartbeatLoop(runCtx context.Context, jobID, instanceID int64, startedAt time.Time) {
+	ticker := time.NewTicker(s.cfg.HeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-runCtx.Done():
+			return
+		case <-ticker.C:
+			attempt, ok := s.currentAttemptWithOK(instanceID)
+			if !ok {
+				return
+			}
+			s.reportJobStatus(jobID, instanceID, attempt, scheduler.JobInstanceStatus_JOB_INSTANCE_STATUS_RUNNING, 0, "", startedAt, time.Time{})
+		}
 	}
 }
 
-func (s *workerServer) reportResult(
-	req *scheduler.RunJobRequest,
+func (s *workerServer) currentAttempt(instanceID int64, fallback uint32) uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if execution, ok := s.running[instanceID]; ok {
+		return execution.attempt
+	}
+	if completed, ok := s.done[instanceID]; ok {
+		return completed.attempt
+	}
+	return fallback
+}
+
+func (s *workerServer) currentAttemptWithOK(instanceID int64) (uint32, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if execution, ok := s.running[instanceID]; ok {
+		return execution.attempt, true
+	}
+	return 0, false
+}
+
+func (s *workerServer) runningStartedAt(instanceID int64) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if execution, ok := s.running[instanceID]; ok {
+		return execution.startedAt, true
+	}
+	return time.Time{}, false
+}
+
+func (s *workerServer) markCompleted(
+	instanceID int64,
+	attempt uint32,
+	status scheduler.JobInstanceStatus,
+	exitCode int32,
+	errMessage string,
+	startedAt time.Time,
+	finishedAt time.Time,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if execution, ok := s.running[instanceID]; ok {
+		execution.cancel()
+		delete(s.running, instanceID)
+	}
+	s.done[instanceID] = completedExecution{
+		attempt:      attempt,
+		status:       status,
+		exitCode:     exitCode,
+		errorMessage: errMessage,
+		startedAt:    startedAt,
+		finishedAt:   finishedAt,
+		recordedAt:   time.Now().UTC(),
+	}
+	s.pruneCompletedLocked(time.Now().UTC())
+}
+
+func (s *workerServer) pruneCompletedLocked(now time.Time) {
+	for instanceID, completed := range s.done {
+		if now.Sub(completed.recordedAt) > s.cfg.CompletedStateTTL {
+			delete(s.done, instanceID)
+		}
+	}
+}
+
+func (s *workerServer) reportJobStatus(
+	jobID int64,
+	instanceID int64,
+	attempt uint32,
 	status scheduler.JobInstanceStatus,
 	exitCode int32,
 	errMessage string,
@@ -338,24 +501,25 @@ func (s *workerServer) reportResult(
 	finishedAt time.Time,
 ) {
 	report := &scheduler.ReportResultRequest{
-		JobId:         req.GetJobId(),
-		JobInstanceId: req.GetJobInstanceId(),
+		JobId:         jobID,
+		JobInstanceId: instanceID,
 		WorkerId:      s.cfg.WorkerID,
 		Status:        status,
 		ExitCode:      exitCode,
 		ErrorMessage:  errMessage,
 		StartedAt:     timestamppb.New(startedAt),
+		Attempt:       attempt,
 	}
 	if !finishedAt.IsZero() {
 		report.FinishedAt = timestamppb.New(finishedAt)
 	}
 
 	deadline := time.Now().Add(s.cfg.MasterReportTimeout)
-	attempt := 0
+	transportAttempt := 0
 	var lastErr error
 
 	for {
-		attempt++
+		transportAttempt++
 
 		targets, err := s.resolveMasterReportTargets()
 		if err != nil {
@@ -364,11 +528,12 @@ func (s *workerServer) reportResult(
 			for _, target := range targets {
 				if err := s.sendResultReport(target, report); err == nil {
 					s.logger.Printf(
-						"report success: instance_id=%d status=%s target=%s attempt=%d",
-						req.GetJobInstanceId(),
+						"report success: instance_id=%d status=%s report_attempt=%d target=%s transport_attempt=%d",
+						instanceID,
 						status.String(),
-						target,
 						attempt,
+						target,
+						transportAttempt,
 					)
 					return
 				} else {
@@ -382,10 +547,11 @@ func (s *workerServer) reportResult(
 		}
 
 		s.logger.Printf(
-			"report retry: instance_id=%d status=%s attempt=%d err=%v",
-			req.GetJobInstanceId(),
+			"report retry: instance_id=%d status=%s report_attempt=%d transport_attempt=%d err=%v",
+			instanceID,
 			status.String(),
 			attempt,
+			transportAttempt,
 			lastErr,
 		)
 
@@ -400,9 +566,11 @@ func (s *workerServer) reportResult(
 	}
 
 	s.logger.Printf(
-		"report failed permanently: instance_id=%d status=%s err=%v",
-		req.GetJobInstanceId(),
+		"report failed permanently: instance_id=%d status=%s report_attempt=%d transport_attempt=%d err=%v",
+		instanceID,
 		status.String(),
+		attempt,
+		transportAttempt,
 		lastErr,
 	)
 }

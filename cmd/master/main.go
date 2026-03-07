@@ -33,6 +33,11 @@ const (
 	defaultSchedulerTickInterval  = time.Second
 	defaultSchedulerCatchupWindow = time.Minute
 	defaultSchedulerMaxCatchup    = 10
+	defaultDispatchAckTimeout     = 5 * time.Second
+	defaultJobMaxRetries          = 2
+	defaultRetryBackoffSeconds    = 2
+	defaultMaxRetryBackoffSeconds = 30
+	defaultHeartbeatTimeoutSecs   = 15
 )
 
 var defaultCronParser = cron.NewParser(
@@ -52,6 +57,7 @@ type config struct {
 	WorkerDiscoveryPrefix   string
 	LeaderElectionKey       string
 	MasterLeaseTTL          int64
+	DispatchAckTimeout      time.Duration
 	SchedulerTickInterval   time.Duration
 	SchedulerCatchupWindow  time.Duration
 	SchedulerMaxCatchup     int
@@ -73,12 +79,16 @@ type masterServer struct {
 }
 
 type createJobRequest struct {
-	Name           string   `json:"name"`
-	CronExpr       string   `json:"cron_expr"`
-	Command        string   `json:"command"`
-	Args           []string `json:"args"`
-	TimeoutSeconds uint32   `json:"timeout_seconds"`
-	Enabled        *bool    `json:"enabled"`
+	Name                    string   `json:"name"`
+	CronExpr                string   `json:"cron_expr"`
+	Command                 string   `json:"command"`
+	Args                    []string `json:"args"`
+	TimeoutSeconds          uint32   `json:"timeout_seconds"`
+	MaxRetries              *uint32  `json:"max_retries"`
+	RetryBackoffSeconds     *uint32  `json:"retry_backoff_seconds"`
+	MaxRetryBackoffSeconds  *uint32  `json:"max_retry_backoff_seconds"`
+	HeartbeatTimeoutSeconds *uint32  `json:"heartbeat_timeout_seconds"`
+	Enabled                 *bool    `json:"enabled"`
 }
 
 type createJobResponse struct {
@@ -91,18 +101,36 @@ type triggerJobResponse struct {
 }
 
 type jobRecord struct {
-	ID             int64
-	Name           string
-	CronExpr       string
-	Command        string
-	Args           []string
-	TimeoutSeconds uint32
-	CreatedAt      time.Time
+	ID                      int64
+	Name                    string
+	CronExpr                string
+	Command                 string
+	Args                    []string
+	TimeoutSeconds          uint32
+	MaxRetries              int
+	RetryBackoffSeconds     int
+	MaxRetryBackoffSeconds  int
+	HeartbeatTimeoutSeconds int
+	CreatedAt               time.Time
 }
 
 type jobInstanceRecord struct {
-	ID     int64
-	Status string
+	ID                      int64
+	JobID                   int64
+	Status                  string
+	ScheduledAt             time.Time
+	Attempt                 int
+	MaxAttempts             int
+	RetryBackoffSeconds     int
+	MaxRetryBackoffSeconds  int
+	HeartbeatTimeoutSeconds int
+	NextRetryAt             sql.NullTime
+	LastHeartbeatAt         sql.NullTime
+	WorkerID                sql.NullString
+	StartedAt               sql.NullTime
+	FinishedAt              sql.NullTime
+	ExitCode                sql.NullInt64
+	ErrorMessage            sql.NullString
 }
 
 type triggerMode struct {
@@ -131,6 +159,13 @@ func main() {
 	if masterLeaseTTL <= 0 {
 		log.Fatalf("MASTER_LEASE_TTL must be > 0, got %d", masterLeaseTTL)
 	}
+	dispatchAckTimeout, err := durationEnvOrDefault("DISPATCH_ACK_TIMEOUT", defaultDispatchAckTimeout)
+	if err != nil {
+		log.Fatalf("invalid DISPATCH_ACK_TIMEOUT: %v", err)
+	}
+	if dispatchAckTimeout <= 0 {
+		log.Fatalf("DISPATCH_ACK_TIMEOUT must be > 0, got %s", dispatchAckTimeout)
+	}
 	schedulerTickInterval, err := durationEnvOrDefault("SCHEDULER_TICK_INTERVAL", defaultSchedulerTickInterval)
 	if err != nil {
 		log.Fatalf("invalid SCHEDULER_TICK_INTERVAL: %v", err)
@@ -158,6 +193,7 @@ func main() {
 		WorkerDiscoveryPrefix:  discovery.NormalizeWorkerPrefix(envOrDefault("WORKER_DISCOVERY_PREFIX", discovery.DefaultWorkerPrefix)),
 		LeaderElectionKey:      election.NormalizeLeaderKey(envOrDefault("LEADER_ELECTION_KEY", election.DefaultLeaderKey)),
 		MasterLeaseTTL:         masterLeaseTTL,
+		DispatchAckTimeout:     dispatchAckTimeout,
 		SchedulerTickInterval:  schedulerTickInterval,
 		SchedulerCatchupWindow: schedulerCatchupWindow,
 		SchedulerMaxCatchup:    schedulerMaxCatchup,
@@ -215,7 +251,7 @@ func main() {
 	go srv.runSchedulerLoop(context.Background())
 
 	logger.Printf(
-		"master started: id=%s grpc=%s advertise_grpc=%s http=%s advertise_http=%s worker_fallback=%s etcd=%v leader_key=%s lease_ttl=%d scheduler_tick=%s catchup_window=%s max_catchup=%d",
+		"master started: id=%s grpc=%s advertise_grpc=%s http=%s advertise_http=%s worker_fallback=%s etcd=%v leader_key=%s lease_ttl=%d dispatch_ack_timeout=%s scheduler_tick=%s catchup_window=%s max_catchup=%d",
 		cfg.MasterID,
 		cfg.MasterGRPCAddr,
 		cfg.MasterAdvertiseGRPCAddr,
@@ -225,6 +261,7 @@ func main() {
 		cfg.EtcdEndpoints,
 		cfg.LeaderElectionKey,
 		cfg.MasterLeaseTTL,
+		cfg.DispatchAckTimeout,
 		cfg.SchedulerTickInterval,
 		cfg.SchedulerCatchupWindow,
 		cfg.SchedulerMaxCatchup,
@@ -321,6 +358,26 @@ func (s *masterServer) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if req.Args == nil {
 		req.Args = []string{}
 	}
+	maxRetries := uint32OrDefault(req.MaxRetries, defaultJobMaxRetries)
+	retryBackoffSeconds := uint32OrDefault(req.RetryBackoffSeconds, defaultRetryBackoffSeconds)
+	maxRetryBackoffSeconds := uint32OrDefault(req.MaxRetryBackoffSeconds, defaultMaxRetryBackoffSeconds)
+	heartbeatTimeoutSeconds := uint32OrDefault(req.HeartbeatTimeoutSeconds, defaultHeartbeatTimeoutSecs)
+	if retryBackoffSeconds == 0 {
+		http.Error(w, "retry_backoff_seconds must be > 0", http.StatusBadRequest)
+		return
+	}
+	if maxRetryBackoffSeconds == 0 {
+		http.Error(w, "max_retry_backoff_seconds must be > 0", http.StatusBadRequest)
+		return
+	}
+	if maxRetryBackoffSeconds < retryBackoffSeconds {
+		http.Error(w, "max_retry_backoff_seconds must be >= retry_backoff_seconds", http.StatusBadRequest)
+		return
+	}
+	if heartbeatTimeoutSeconds == 0 {
+		http.Error(w, "heartbeat_timeout_seconds must be > 0", http.StatusBadRequest)
+		return
+	}
 	enabled := true
 	if req.Enabled != nil {
 		enabled = *req.Enabled
@@ -333,13 +390,19 @@ func (s *masterServer) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := s.db.Exec(
-		`INSERT INTO jobs(name, cron_expr, command, args_json, timeout_seconds, enabled)
-		 VALUES(?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO jobs(
+		     name, cron_expr, command, args_json, timeout_seconds,
+		     max_retries, retry_backoff_seconds, max_retry_backoff_seconds, heartbeat_timeout_seconds, enabled
+		 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		req.Name,
 		req.CronExpr,
 		req.Command,
 		argsJSON,
 		req.TimeoutSeconds,
+		maxRetries,
+		retryBackoffSeconds,
+		maxRetryBackoffSeconds,
+		heartbeatTimeoutSeconds,
 		enabled,
 	)
 	if err != nil {
@@ -353,7 +416,16 @@ func (s *masterServer) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Printf("create job: id=%d name=%s command=%s", jobID, req.Name, req.Command)
+	s.logger.Printf(
+		"create job: id=%d name=%s command=%s max_retries=%d retry_backoff=%ds max_retry_backoff=%ds heartbeat_timeout=%ds",
+		jobID,
+		req.Name,
+		req.Command,
+		maxRetries,
+		retryBackoffSeconds,
+		maxRetryBackoffSeconds,
+		heartbeatTimeoutSeconds,
+	)
 	writeJSON(w, http.StatusOK, createJobResponse{ID: jobID})
 }
 
@@ -421,23 +493,7 @@ func (s *masterServer) handleGetJobInstance(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	var (
-		jobID      int64
-		status     string
-		scheduled  time.Time
-		workerID   sql.NullString
-		startedAt  sql.NullTime
-		finishedAt sql.NullTime
-		exitCode   sql.NullInt64
-		errMsg     sql.NullString
-	)
-
-	err = s.db.QueryRowContext(
-		r.Context(),
-		`SELECT job_id, status, scheduled_at, worker_id, started_at, finished_at, exit_code, error_message
-		 FROM job_instances WHERE id=?`,
-		instanceID,
-	).Scan(&jobID, &status, &scheduled, &workerID, &startedAt, &finishedAt, &exitCode, &errMsg)
+	instance, err := s.getJobInstanceByID(r.Context(), instanceID)
 	if err != nil {
 		code := http.StatusInternalServerError
 		if errors.Is(err, sql.ErrNoRows) {
@@ -449,24 +505,32 @@ func (s *masterServer) handleGetJobInstance(w http.ResponseWriter, r *http.Reque
 
 	resp := map[string]interface{}{
 		"id":           instanceID,
-		"job_id":       jobID,
-		"status":       status,
-		"scheduled_at": scheduled.UTC().Format(time.RFC3339Nano),
+		"job_id":       instance.JobID,
+		"status":       instance.Status,
+		"scheduled_at": instance.ScheduledAt.UTC().Format(time.RFC3339Nano),
+		"attempt":      instance.Attempt,
+		"max_attempts": instance.MaxAttempts,
 	}
-	if workerID.Valid {
-		resp["worker_id"] = workerID.String
+	if instance.NextRetryAt.Valid {
+		resp["next_retry_at"] = instance.NextRetryAt.Time.UTC().Format(time.RFC3339Nano)
 	}
-	if startedAt.Valid {
-		resp["started_at"] = startedAt.Time.UTC().Format(time.RFC3339Nano)
+	if instance.LastHeartbeatAt.Valid {
+		resp["last_heartbeat_at"] = instance.LastHeartbeatAt.Time.UTC().Format(time.RFC3339Nano)
 	}
-	if finishedAt.Valid {
-		resp["finished_at"] = finishedAt.Time.UTC().Format(time.RFC3339Nano)
+	if instance.WorkerID.Valid {
+		resp["worker_id"] = instance.WorkerID.String
 	}
-	if exitCode.Valid {
-		resp["exit_code"] = exitCode.Int64
+	if instance.StartedAt.Valid {
+		resp["started_at"] = instance.StartedAt.Time.UTC().Format(time.RFC3339Nano)
 	}
-	if errMsg.Valid {
-		resp["error_message"] = errMsg.String
+	if instance.FinishedAt.Valid {
+		resp["finished_at"] = instance.FinishedAt.Time.UTC().Format(time.RFC3339Nano)
+	}
+	if instance.ExitCode.Valid {
+		resp["exit_code"] = instance.ExitCode.Int64
+	}
+	if instance.ErrorMessage.Valid {
+		resp["error_message"] = instance.ErrorMessage.String
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -480,9 +544,23 @@ func (s *masterServer) loadJob(ctx context.Context, jobID int64) (jobRecord, err
 	job.ID = jobID
 	err := s.db.QueryRowContext(
 		ctx,
-		`SELECT name, cron_expr, command, args_json, timeout_seconds, created_at FROM jobs WHERE id=?`,
+		`SELECT
+		     name, cron_expr, command, args_json, timeout_seconds,
+		     max_retries, retry_backoff_seconds, max_retry_backoff_seconds, heartbeat_timeout_seconds, created_at
+		 FROM jobs WHERE id=?`,
 		jobID,
-	).Scan(&job.Name, &job.CronExpr, &job.Command, &argsJSON, &job.TimeoutSeconds, &job.CreatedAt)
+	).Scan(
+		&job.Name,
+		&job.CronExpr,
+		&job.Command,
+		&argsJSON,
+		&job.TimeoutSeconds,
+		&job.MaxRetries,
+		&job.RetryBackoffSeconds,
+		&job.MaxRetryBackoffSeconds,
+		&job.HeartbeatTimeoutSeconds,
+		&job.CreatedAt,
+	)
 	if err != nil {
 		return jobRecord{}, err
 	}
@@ -498,7 +576,9 @@ func (s *masterServer) loadJob(ctx context.Context, jobID int64) (jobRecord, err
 func (s *masterServer) loadSchedulableJobs(ctx context.Context) ([]jobRecord, error) {
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT id, name, cron_expr, command, args_json, timeout_seconds, created_at
+		`SELECT
+		     id, name, cron_expr, command, args_json, timeout_seconds,
+		     max_retries, retry_backoff_seconds, max_retry_backoff_seconds, heartbeat_timeout_seconds, created_at
 		 FROM jobs
 		 WHERE enabled=1 AND cron_expr<>?
 		 ORDER BY id`,
@@ -515,7 +595,19 @@ func (s *masterServer) loadSchedulableJobs(ctx context.Context) ([]jobRecord, er
 			job      jobRecord
 			argsJSON []byte
 		)
-		if err := rows.Scan(&job.ID, &job.Name, &job.CronExpr, &job.Command, &argsJSON, &job.TimeoutSeconds, &job.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&job.ID,
+			&job.Name,
+			&job.CronExpr,
+			&job.Command,
+			&argsJSON,
+			&job.TimeoutSeconds,
+			&job.MaxRetries,
+			&job.RetryBackoffSeconds,
+			&job.MaxRetryBackoffSeconds,
+			&job.HeartbeatTimeoutSeconds,
+			&job.CreatedAt,
+		); err != nil {
 			return nil, err
 		}
 		if len(argsJSON) > 0 {
@@ -552,12 +644,12 @@ func (s *masterServer) scanAndDispatchDueJobs(ctx context.Context, now time.Time
 		return
 	}
 
+	s.recoverRunningTimeouts(ctx, now)
+	s.dispatchDuePendingInstances(ctx, now, "recovery")
+
 	jobs, err := s.loadSchedulableJobs(ctx)
 	if err != nil {
 		s.logger.Printf("scheduler load jobs failed: %v", err)
-		return
-	}
-	if len(jobs) == 0 {
 		return
 	}
 
@@ -593,6 +685,8 @@ func (s *masterServer) scanAndDispatchDueJobs(ctx context.Context, now time.Time
 			}
 		}
 	}
+
+	s.dispatchDuePendingInstances(ctx, now, "recovery")
 }
 
 func (s *masterServer) triggerJob(
@@ -603,7 +697,7 @@ func (s *masterServer) triggerJob(
 ) (jobInstanceRecord, error) {
 	normalizedScheduledAt := normalizeScheduledAt(scheduledAt)
 
-	instance, created, err := s.ensureJobInstance(ctx, job.ID, normalizedScheduledAt)
+	instance, created, err := s.ensureJobInstance(ctx, job, normalizedScheduledAt)
 	if err != nil {
 		return jobInstanceRecord{}, err
 	}
@@ -619,92 +713,429 @@ func (s *masterServer) triggerJob(
 		}
 	}
 
-	runReq := &scheduler.RunJobRequest{
-		JobId:          job.ID,
-		JobInstanceId:  instance.ID,
-		Command:        job.Command,
-		Args:           job.Args,
-		TimeoutSeconds: job.TimeoutSeconds,
-		ScheduledAt:    timestamppb.New(normalizedScheduledAt),
-	}
-
-	worker, err := s.dispatchRunJob(ctx, runReq)
-	if err != nil {
-		if mode.MarkFailedOnDispatchError {
-			s.markDispatchFailed(ctx, instance.ID, err)
-		}
-		return instance, err
-	}
-
 	action := "trigger job"
 	if !created {
 		action = "redispatch pending job"
 	}
+
+	dispatched, err := s.dispatchPendingInstance(ctx, job, instance, mode.Source)
+	if err != nil {
+		return dispatched, err
+	}
+
 	s.logger.Printf(
-		"%s: source=%s job_id=%d instance_id=%d scheduled_at=%s worker_id=%s worker_addr=%s",
+		"%s: source=%s job_id=%d instance_id=%d attempt=%d scheduled_at=%s",
 		action,
 		mode.Source,
 		job.ID,
-		instance.ID,
+		dispatched.ID,
+		dispatched.Attempt,
 		normalizedScheduledAt.Format(time.RFC3339Nano),
-		worker.ID,
-		worker.Addr,
 	)
-	return instance, nil
+	return dispatched, nil
 }
 
-func (s *masterServer) ensureJobInstance(ctx context.Context, jobID int64, scheduledAt time.Time) (jobInstanceRecord, bool, error) {
+func (s *masterServer) ensureJobInstance(ctx context.Context, job jobRecord, scheduledAt time.Time) (jobInstanceRecord, bool, error) {
+	maxAttempts := job.MaxRetries + 1
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+
 	res, err := s.db.ExecContext(
 		ctx,
-		`INSERT INTO job_instances(job_id, scheduled_at, status) VALUES (?, ?, 'PENDING')`,
-		jobID,
+		`INSERT INTO job_instances(
+		     job_id, scheduled_at, status, attempt, max_attempts,
+		     retry_backoff_seconds, max_retry_backoff_seconds, heartbeat_timeout_seconds
+		 ) VALUES (?, ?, 'PENDING', 0, ?, ?, ?, ?)`,
+		job.ID,
 		scheduledAt,
+		maxAttempts,
+		maxPositive(job.RetryBackoffSeconds, defaultRetryBackoffSeconds),
+		maxPositive(job.MaxRetryBackoffSeconds, defaultMaxRetryBackoffSeconds),
+		maxPositive(job.HeartbeatTimeoutSeconds, defaultHeartbeatTimeoutSecs),
 	)
 	if err == nil {
 		instanceID, readErr := res.LastInsertId()
 		if readErr != nil {
 			return jobInstanceRecord{}, false, fmt.Errorf("read job instance id failed: %w", readErr)
 		}
-		return jobInstanceRecord{ID: instanceID, Status: "PENDING"}, true, nil
+		instance, loadErr := s.getJobInstanceByID(ctx, instanceID)
+		if loadErr != nil {
+			return jobInstanceRecord{}, false, fmt.Errorf("load inserted job instance failed: %w", loadErr)
+		}
+		return instance, true, nil
 	}
 	if !isDuplicateKeyError(err) {
 		return jobInstanceRecord{}, false, fmt.Errorf("insert job instance failed: %w", err)
 	}
 
-	instance, loadErr := s.getJobInstanceBySlot(ctx, jobID, scheduledAt)
+	instance, loadErr := s.getJobInstanceBySlot(ctx, job.ID, scheduledAt)
 	if loadErr != nil {
 		return jobInstanceRecord{}, false, fmt.Errorf("load existing job instance failed: %w", loadErr)
 	}
 	return instance, false, nil
 }
 
+func (s *masterServer) dispatchDuePendingInstances(ctx context.Context, now time.Time, source string) {
+	instances, err := s.loadDuePendingInstances(ctx, now)
+	if err != nil {
+		s.logger.Printf("load due pending instances failed: %v", err)
+		return
+	}
+
+	for _, instance := range instances {
+		job, err := s.loadJob(ctx, instance.JobID)
+		if err != nil {
+			s.logger.Printf("load job for pending instance failed: instance_id=%d err=%v", instance.ID, err)
+			continue
+		}
+		if _, err := s.dispatchPendingInstance(ctx, job, instance, source); err != nil {
+			s.logger.Printf("dispatch pending instance failed: instance_id=%d err=%v", instance.ID, err)
+		}
+	}
+}
+
+func (s *masterServer) dispatchPendingInstance(
+	ctx context.Context,
+	job jobRecord,
+	instance jobInstanceRecord,
+	source string,
+) (jobInstanceRecord, error) {
+	if instance.Status != "PENDING" {
+		return instance, nil
+	}
+
+	nextAttempt := instance.Attempt + 1
+	if nextAttempt > instance.MaxAttempts {
+		if err := s.markInstanceFailed(ctx, instance, instance.Attempt, instance.WorkerID, "retry limit exceeded", time.Now().UTC()); err != nil {
+			return instance, err
+		}
+		return s.getJobInstanceByID(ctx, instance.ID)
+	}
+
+	preferredWorkerID := ""
+	if instance.WorkerID.Valid {
+		preferredWorkerID = instance.WorkerID.String
+	}
+
+	worker, err := s.selectWorker(preferredWorkerID)
+	if err != nil {
+		return s.scheduleRetry(ctx, instance, nextAttempt, "select worker failed: "+err.Error(), time.Now().UTC())
+	}
+
+	claimed, err := s.claimDispatchAttempt(ctx, instance, worker.ID, nextAttempt, time.Now().UTC())
+	if err != nil {
+		return instance, err
+	}
+
+	runReq := &scheduler.RunJobRequest{
+		JobId:          job.ID,
+		JobInstanceId:  claimed.ID,
+		Command:        job.Command,
+		Args:           job.Args,
+		TimeoutSeconds: job.TimeoutSeconds,
+		ScheduledAt:    timestamppb.New(claimed.ScheduledAt),
+		Attempt:        uint32(nextAttempt),
+	}
+
+	worker, err = s.dispatchRunJob(ctx, runReq, worker)
+	if err != nil {
+		retried, retryErr := s.scheduleRetry(ctx, claimed, nextAttempt, "dispatch run job failed: "+err.Error(), time.Now().UTC())
+		if retryErr != nil {
+			return claimed, fmt.Errorf("%v (schedule retry failed: %w)", err, retryErr)
+		}
+		return retried, err
+	}
+
+	s.logger.Printf(
+		"dispatch job: source=%s job_id=%d instance_id=%d attempt=%d scheduled_at=%s worker_id=%s worker_addr=%s",
+		source,
+		job.ID,
+		claimed.ID,
+		nextAttempt,
+		claimed.ScheduledAt.Format(time.RFC3339Nano),
+		worker.ID,
+		worker.Addr,
+	)
+	return s.getJobInstanceByID(ctx, claimed.ID)
+}
+
 func (s *masterServer) getJobInstanceBySlot(ctx context.Context, jobID int64, scheduledAt time.Time) (jobInstanceRecord, error) {
+	return s.scanJobInstance(
+		s.db.QueryRowContext(
+			ctx,
+			`SELECT
+			     id, job_id, status, scheduled_at, attempt, max_attempts,
+			     retry_backoff_seconds, max_retry_backoff_seconds, heartbeat_timeout_seconds,
+			     next_retry_at, last_heartbeat_at, worker_id, started_at, finished_at, exit_code, error_message
+			 FROM job_instances WHERE job_id=? AND scheduled_at=?`,
+			jobID,
+			scheduledAt,
+		),
+	)
+}
+
+func (s *masterServer) getJobInstanceByID(ctx context.Context, instanceID int64) (jobInstanceRecord, error) {
+	return s.scanJobInstance(
+		s.db.QueryRowContext(
+			ctx,
+			`SELECT
+			     id, job_id, status, scheduled_at, attempt, max_attempts,
+			     retry_backoff_seconds, max_retry_backoff_seconds, heartbeat_timeout_seconds,
+			     next_retry_at, last_heartbeat_at, worker_id, started_at, finished_at, exit_code, error_message
+			 FROM job_instances WHERE id=?`,
+			instanceID,
+		),
+	)
+}
+
+func (s *masterServer) scanJobInstance(row *sql.Row) (jobInstanceRecord, error) {
 	var instance jobInstanceRecord
-	err := s.db.QueryRowContext(
-		ctx,
-		`SELECT id, status FROM job_instances WHERE job_id=? AND scheduled_at=?`,
-		jobID,
-		scheduledAt,
-	).Scan(&instance.ID, &instance.Status)
+	err := row.Scan(
+		&instance.ID,
+		&instance.JobID,
+		&instance.Status,
+		&instance.ScheduledAt,
+		&instance.Attempt,
+		&instance.MaxAttempts,
+		&instance.RetryBackoffSeconds,
+		&instance.MaxRetryBackoffSeconds,
+		&instance.HeartbeatTimeoutSeconds,
+		&instance.NextRetryAt,
+		&instance.LastHeartbeatAt,
+		&instance.WorkerID,
+		&instance.StartedAt,
+		&instance.FinishedAt,
+		&instance.ExitCode,
+		&instance.ErrorMessage,
+	)
 	if err != nil {
 		return jobInstanceRecord{}, err
 	}
 	return instance, nil
 }
 
-func (s *masterServer) markDispatchFailed(ctx context.Context, instanceID int64, dispatchErr error) {
+func (s *masterServer) loadDuePendingInstances(ctx context.Context, now time.Time) ([]jobInstanceRecord, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT
+		     id, job_id, status, scheduled_at, attempt, max_attempts,
+		     retry_backoff_seconds, max_retry_backoff_seconds, heartbeat_timeout_seconds,
+		     next_retry_at, last_heartbeat_at, worker_id, started_at, finished_at, exit_code, error_message
+		 FROM job_instances
+		 WHERE status='PENDING' AND (next_retry_at IS NULL OR next_retry_at <= ?)
+		 ORDER BY COALESCE(next_retry_at, scheduled_at), id`,
+		now.UTC(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	instances := make([]jobInstanceRecord, 0)
+	for rows.Next() {
+		var instance jobInstanceRecord
+		if err := rows.Scan(
+			&instance.ID,
+			&instance.JobID,
+			&instance.Status,
+			&instance.ScheduledAt,
+			&instance.Attempt,
+			&instance.MaxAttempts,
+			&instance.RetryBackoffSeconds,
+			&instance.MaxRetryBackoffSeconds,
+			&instance.HeartbeatTimeoutSeconds,
+			&instance.NextRetryAt,
+			&instance.LastHeartbeatAt,
+			&instance.WorkerID,
+			&instance.StartedAt,
+			&instance.FinishedAt,
+			&instance.ExitCode,
+			&instance.ErrorMessage,
+		); err != nil {
+			return nil, err
+		}
+		instances = append(instances, instance)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return instances, nil
+}
+
+func (s *masterServer) loadRunningInstances(ctx context.Context) ([]jobInstanceRecord, error) {
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT
+		     id, job_id, status, scheduled_at, attempt, max_attempts,
+		     retry_backoff_seconds, max_retry_backoff_seconds, heartbeat_timeout_seconds,
+		     next_retry_at, last_heartbeat_at, worker_id, started_at, finished_at, exit_code, error_message
+		 FROM job_instances
+		 WHERE status='RUNNING'
+		 ORDER BY id`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	instances := make([]jobInstanceRecord, 0)
+	for rows.Next() {
+		var instance jobInstanceRecord
+		if err := rows.Scan(
+			&instance.ID,
+			&instance.JobID,
+			&instance.Status,
+			&instance.ScheduledAt,
+			&instance.Attempt,
+			&instance.MaxAttempts,
+			&instance.RetryBackoffSeconds,
+			&instance.MaxRetryBackoffSeconds,
+			&instance.HeartbeatTimeoutSeconds,
+			&instance.NextRetryAt,
+			&instance.LastHeartbeatAt,
+			&instance.WorkerID,
+			&instance.StartedAt,
+			&instance.FinishedAt,
+			&instance.ExitCode,
+			&instance.ErrorMessage,
+		); err != nil {
+			return nil, err
+		}
+		instances = append(instances, instance)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return instances, nil
+}
+
+func (s *masterServer) recoverRunningTimeouts(ctx context.Context, now time.Time) {
+	instances, err := s.loadRunningInstances(ctx)
+	if err != nil {
+		s.logger.Printf("load running instances failed: %v", err)
+		return
+	}
+
+	for _, instance := range instances {
+		if !isRunningTimedOut(instance, now) {
+			continue
+		}
+
+		reason := fmt.Sprintf("heartbeat timeout: attempt=%d worker=%s", instance.Attempt, instance.WorkerID.String)
+		if _, err := s.scheduleRetry(ctx, instance, instance.Attempt, reason, now); err != nil {
+			s.logger.Printf("recover running timeout failed: instance_id=%d err=%v", instance.ID, err)
+		}
+	}
+}
+
+func (s *masterServer) claimDispatchAttempt(
+	ctx context.Context,
+	instance jobInstanceRecord,
+	workerID string,
+	attempt int,
+	now time.Time,
+) (jobInstanceRecord, error) {
+	nextRetryAt := now.Add(s.cfg.DispatchAckTimeout)
 	_, err := s.db.ExecContext(
 		ctx,
 		`UPDATE job_instances
-		 SET status='FAILED', finished_at=?, error_message=?, updated_at=CURRENT_TIMESTAMP
-		 WHERE id=? AND status='PENDING'`,
-		time.Now().UTC(),
-		"dispatch run job failed: "+dispatchErr.Error(),
-		instanceID,
+		 SET status='PENDING', attempt=?, worker_id=?, started_at=NULL, finished_at=NULL, exit_code=NULL,
+		     error_message=NULL, last_heartbeat_at=NULL, next_retry_at=?, updated_at=CURRENT_TIMESTAMP
+		 WHERE id=? AND status='PENDING' AND attempt=?`,
+		attempt,
+		workerID,
+		nextRetryAt,
+		instance.ID,
+		instance.Attempt,
 	)
 	if err != nil {
-		s.logger.Printf("mark dispatch failed: instance_id=%d err=%v", instanceID, err)
+		return jobInstanceRecord{}, fmt.Errorf("claim dispatch attempt failed: %w", err)
 	}
+	return s.getJobInstanceByID(ctx, instance.ID)
+}
+
+func (s *masterServer) scheduleRetry(
+	ctx context.Context,
+	instance jobInstanceRecord,
+	attempt int,
+	reason string,
+	now time.Time,
+) (jobInstanceRecord, error) {
+	if attempt <= 0 {
+		attempt = maxPositive(instance.Attempt, 1)
+	}
+	if attempt >= instance.MaxAttempts {
+		if err := s.markInstanceFailed(ctx, instance, attempt, instance.WorkerID, reason, now); err != nil {
+			return jobInstanceRecord{}, err
+		}
+		return s.getJobInstanceByID(ctx, instance.ID)
+	}
+
+	delay := computeRetryDelay(
+		attempt,
+		maxPositive(instance.RetryBackoffSeconds, defaultRetryBackoffSeconds),
+		maxPositive(instance.MaxRetryBackoffSeconds, defaultMaxRetryBackoffSeconds),
+	)
+	nextRetryAt := now.Add(delay)
+	_, err := s.db.ExecContext(
+		ctx,
+		`UPDATE job_instances
+		 SET status='PENDING', attempt=?, worker_id=NULL, started_at=NULL, finished_at=NULL, exit_code=NULL,
+		     error_message=?, last_heartbeat_at=NULL, next_retry_at=?, updated_at=CURRENT_TIMESTAMP
+		 WHERE id=?`,
+		attempt,
+		reason,
+		nextRetryAt,
+		instance.ID,
+	)
+	if err != nil {
+		return jobInstanceRecord{}, fmt.Errorf("schedule retry failed: %w", err)
+	}
+
+	s.logger.Printf(
+		"retry scheduled: instance_id=%d attempt=%d/%d next_retry_at=%s reason=%s",
+		instance.ID,
+		attempt,
+		instance.MaxAttempts,
+		nextRetryAt.UTC().Format(time.RFC3339Nano),
+		reason,
+	)
+	return s.getJobInstanceByID(ctx, instance.ID)
+}
+
+func (s *masterServer) markInstanceFailed(
+	ctx context.Context,
+	instance jobInstanceRecord,
+	attempt int,
+	workerID sql.NullString,
+	reason string,
+	failedAt time.Time,
+) error {
+	_, err := s.db.ExecContext(
+		ctx,
+		`UPDATE job_instances
+		 SET status='FAILED', attempt=?, worker_id=?, finished_at=?, exit_code=COALESCE(exit_code, -1),
+		     error_message=?, next_retry_at=NULL, last_heartbeat_at=NULL, updated_at=CURRENT_TIMESTAMP
+		 WHERE id=?`,
+		attempt,
+		nullableStringValue(workerID),
+		failedAt.UTC(),
+		reason,
+		instance.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("mark instance failed: %w", err)
+	}
+
+	s.logger.Printf(
+		"instance failed permanently: instance_id=%d attempt=%d/%d reason=%s",
+		instance.ID,
+		attempt,
+		instance.MaxAttempts,
+		reason,
+	)
+	return nil
 }
 
 func (s *masterServer) runLeaderElectionLoop(ctx context.Context) {
@@ -1041,12 +1472,18 @@ func (s *masterServer) removeWorker(workerID string) {
 	s.logger.Printf("worker removed: id=%s addr=%s", reg.ID, reg.Addr)
 }
 
-func (s *masterServer) selectWorker() (discovery.WorkerRegistration, error) {
+func (s *masterServer) selectWorker(preferredWorkerID string) (discovery.WorkerRegistration, error) {
 	s.workersMu.Lock()
 	defer s.workersMu.Unlock()
 
 	if len(s.workerOrder) == 0 {
 		return discovery.WorkerRegistration{}, fmt.Errorf("no workers available")
+	}
+
+	if preferredWorkerID = strings.TrimSpace(preferredWorkerID); preferredWorkerID != "" {
+		if reg, ok := s.workers[preferredWorkerID]; ok {
+			return reg, nil
+		}
 	}
 
 	for attempts := 0; attempts < len(s.workerOrder); attempts++ {
@@ -1080,12 +1517,7 @@ func sortedWorkerIDs(workers map[string]discovery.WorkerRegistration) []string {
 	return workerIDs
 }
 
-func (s *masterServer) dispatchRunJob(parent context.Context, req *scheduler.RunJobRequest) (discovery.WorkerRegistration, error) {
-	worker, err := s.selectWorker()
-	if err != nil {
-		return discovery.WorkerRegistration{}, err
-	}
-
+func (s *masterServer) dispatchRunJob(parent context.Context, req *scheduler.RunJobRequest, worker discovery.WorkerRegistration) (discovery.WorkerRegistration, error) {
 	ctx, cancel := context.WithTimeout(parent, 6*time.Second)
 	defer cancel()
 
@@ -1115,54 +1547,128 @@ func (s *masterServer) ReportResult(ctx context.Context, req *scheduler.ReportRe
 		return &scheduler.ReportResultResponse{Accepted: false, Message: "unsupported status"}, nil
 	}
 
-	var current string
-	err := s.db.QueryRowContext(ctx, `SELECT status FROM job_instances WHERE id=?`, req.GetJobInstanceId()).Scan(&current)
+	instance, err := s.getJobInstanceByID(ctx, req.GetJobInstanceId())
 	if err != nil {
-		return &scheduler.ReportResultResponse{Accepted: false, Message: fmt.Sprintf("query status failed: %v", err)}, nil
+		return &scheduler.ReportResultResponse{Accepted: false, Message: fmt.Sprintf("query instance failed: %v", err)}, nil
 	}
 
-	if !isValidTransition(current, nextStatus) {
+	reportAttempt := int(req.GetAttempt())
+	if reportAttempt <= 0 {
+		reportAttempt = instance.Attempt
+	}
+	if reportAttempt < instance.Attempt {
+		return &scheduler.ReportResultResponse{Accepted: true, Message: "stale attempt ignored"}, nil
+	}
+	if reportAttempt > instance.Attempt {
 		return &scheduler.ReportResultResponse{
 			Accepted: false,
-			Message:  fmt.Sprintf("invalid transition: %s -> %s", current, nextStatus),
+			Message:  fmt.Sprintf("attempt mismatch: report=%d current=%d", reportAttempt, instance.Attempt),
+		}, nil
+	}
+	if !isValidTransition(instance.Status, nextStatus) {
+		return &scheduler.ReportResultResponse{
+			Accepted: false,
+			Message:  fmt.Sprintf("invalid transition: %s -> %s", instance.Status, nextStatus),
 		}, nil
 	}
 
-	if nextStatus == "RUNNING" {
-		_, err = s.db.ExecContext(
+	now := time.Now().UTC()
+	workerID := nullableWorkerID(req.GetWorkerId(), instance.WorkerID)
+	startedAt := coalesceOptionalTime(req.GetStartedAt(), instance.StartedAt)
+
+	switch nextStatus {
+	case "RUNNING":
+		res, execErr := s.db.ExecContext(
 			ctx,
 			`UPDATE job_instances
-			 SET status=?, worker_id=?, started_at=COALESCE(?, started_at), updated_at=CURRENT_TIMESTAMP
-			 WHERE id=?`,
-			nextStatus,
-			req.GetWorkerId(),
-			optionalTime(req.GetStartedAt()),
-			req.GetJobInstanceId(),
+			 SET status='RUNNING', worker_id=?, started_at=?, last_heartbeat_at=?, next_retry_at=NULL, updated_at=CURRENT_TIMESTAMP
+			 WHERE id=? AND attempt=? AND status IN ('PENDING', 'RUNNING')`,
+			workerID,
+			startedAt,
+			now,
+			instance.ID,
+			instance.Attempt,
 		)
-	} else {
-		_, err = s.db.ExecContext(
+		if execErr != nil {
+			return &scheduler.ReportResultResponse{Accepted: false, Message: fmt.Sprintf("update running heartbeat failed: %v", execErr)}, nil
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err == nil && rowsAffected == 0 {
+			return &scheduler.ReportResultResponse{Accepted: true, Message: "stale running heartbeat ignored"}, nil
+		}
+	case "SUCCESS":
+		res, execErr := s.db.ExecContext(
 			ctx,
 			`UPDATE job_instances
-			 SET status=?, worker_id=?, started_at=COALESCE(?, started_at), finished_at=COALESCE(?, finished_at),
-			     exit_code=?, error_message=?, updated_at=CURRENT_TIMESTAMP
-			 WHERE id=?`,
-			nextStatus,
-			req.GetWorkerId(),
-			optionalTime(req.GetStartedAt()),
-			optionalTime(req.GetFinishedAt()),
+			 SET status='SUCCESS', worker_id=?, started_at=?, finished_at=?, exit_code=?, error_message=?, last_heartbeat_at=?, next_retry_at=NULL, updated_at=CURRENT_TIMESTAMP
+			 WHERE id=? AND attempt=? AND status IN ('PENDING', 'RUNNING')`,
+			workerID,
+			startedAt,
+			coalesceOptionalTime(req.GetFinishedAt(), instance.FinishedAt),
 			req.GetExitCode(),
-			req.GetErrorMessage(),
-			req.GetJobInstanceId(),
+			strings.TrimSpace(req.GetErrorMessage()),
+			now,
+			instance.ID,
+			instance.Attempt,
 		)
-	}
-	if err != nil {
-		return &scheduler.ReportResultResponse{Accepted: false, Message: fmt.Sprintf("update job instance failed: %v", err)}, nil
+		if execErr != nil {
+			return &scheduler.ReportResultResponse{Accepted: false, Message: fmt.Sprintf("update success result failed: %v", execErr)}, nil
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err == nil && rowsAffected == 0 {
+			return &scheduler.ReportResultResponse{Accepted: true, Message: "stale success report ignored"}, nil
+		}
+	default:
+		reason := strings.TrimSpace(req.GetErrorMessage())
+		if reason == "" {
+			reason = nextStatus
+		}
+		if reportAttempt < instance.MaxAttempts {
+			retried, retryErr := s.scheduleRetry(ctx, instance, reportAttempt, reason, now)
+			if retryErr != nil {
+				return &scheduler.ReportResultResponse{Accepted: false, Message: retryErr.Error()}, nil
+			}
+			s.logger.Printf(
+				"report scheduled retry: instance_id=%d status=%s attempt=%d/%d next_retry_at=%s worker=%s",
+				retried.ID,
+				nextStatus,
+				reportAttempt,
+				retried.MaxAttempts,
+				optionalTimeString(retried.NextRetryAt),
+				req.GetWorkerId(),
+			)
+			return &scheduler.ReportResultResponse{Accepted: true, Message: "retry scheduled"}, nil
+		}
+
+		res, execErr := s.db.ExecContext(
+			ctx,
+			`UPDATE job_instances
+			 SET status='FAILED', worker_id=?, started_at=?, finished_at=?, exit_code=?, error_message=?, last_heartbeat_at=?, next_retry_at=NULL, updated_at=CURRENT_TIMESTAMP
+			 WHERE id=? AND attempt=? AND status IN ('PENDING', 'RUNNING')`,
+			workerID,
+			startedAt,
+			coalesceOptionalTime(req.GetFinishedAt(), instance.FinishedAt),
+			req.GetExitCode(),
+			reason,
+			now,
+			instance.ID,
+			instance.Attempt,
+		)
+		if execErr != nil {
+			return &scheduler.ReportResultResponse{Accepted: false, Message: fmt.Sprintf("update terminal result failed: %v", execErr)}, nil
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err == nil && rowsAffected == 0 {
+			return &scheduler.ReportResultResponse{Accepted: true, Message: "stale terminal report ignored"}, nil
+		}
 	}
 
 	s.logger.Printf(
-		"report result: instance_id=%d status=%s worker=%s exit_code=%d",
+		"report result: instance_id=%d status=%s attempt=%d/%d worker=%s exit_code=%d",
 		req.GetJobInstanceId(),
 		nextStatus,
+		reportAttempt,
+		instance.MaxAttempts,
 		req.GetWorkerId(),
 		req.GetExitCode(),
 	)
@@ -1192,7 +1698,7 @@ func isValidTransition(from, to string) bool {
 	}
 	switch from {
 	case "PENDING":
-		return to == "RUNNING" || to == "KILLED"
+		return to == "RUNNING" || to == "SUCCESS" || to == "FAILED" || to == "KILLED"
 	case "RUNNING":
 		return to == "SUCCESS" || to == "FAILED" || to == "KILLED"
 	default:
@@ -1200,15 +1706,94 @@ func isValidTransition(from, to string) bool {
 	}
 }
 
-func optionalTime(ts *timestamppb.Timestamp) interface{} {
+func coalesceOptionalTime(ts *timestamppb.Timestamp, fallback sql.NullTime) interface{} {
 	if ts == nil {
+		if fallback.Valid {
+			return fallback.Time.UTC()
+		}
 		return nil
 	}
 	t := ts.AsTime()
 	if t.IsZero() {
+		if fallback.Valid {
+			return fallback.Time.UTC()
+		}
 		return nil
 	}
 	return t.UTC()
+}
+
+func nullableWorkerID(workerID string, fallback sql.NullString) interface{} {
+	workerID = strings.TrimSpace(workerID)
+	if workerID != "" {
+		return workerID
+	}
+	return nullableStringValue(fallback)
+}
+
+func nullableStringValue(value sql.NullString) interface{} {
+	if value.Valid {
+		return value.String
+	}
+	return nil
+}
+
+func optionalTimeString(value sql.NullTime) string {
+	if !value.Valid {
+		return ""
+	}
+	return value.Time.UTC().Format(time.RFC3339Nano)
+}
+
+func uint32OrDefault(value *uint32, fallback int) uint32 {
+	if value == nil {
+		return uint32(maxPositive(fallback, 0))
+	}
+	return *value
+}
+
+func maxPositive(value, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
+
+func computeRetryDelay(attempt, baseSeconds, maxSeconds int) time.Duration {
+	baseSeconds = maxPositive(baseSeconds, defaultRetryBackoffSeconds)
+	maxSeconds = maxPositive(maxSeconds, baseSeconds)
+	if maxSeconds < baseSeconds {
+		maxSeconds = baseSeconds
+	}
+
+	delaySeconds := int64(baseSeconds)
+	for step := 1; step < attempt; step++ {
+		delaySeconds *= 2
+		if delaySeconds >= int64(maxSeconds) {
+			delaySeconds = int64(maxSeconds)
+			break
+		}
+	}
+	if delaySeconds < 1 {
+		delaySeconds = 1
+	}
+	return time.Duration(delaySeconds) * time.Second
+}
+
+func isRunningTimedOut(instance jobInstanceRecord, now time.Time) bool {
+	if instance.Status != "RUNNING" {
+		return false
+	}
+
+	anchor := instance.ScheduledAt
+	if instance.LastHeartbeatAt.Valid {
+		anchor = instance.LastHeartbeatAt.Time.UTC()
+	} else if instance.StartedAt.Valid {
+		anchor = instance.StartedAt.Time.UTC()
+	}
+
+	timeout := time.Duration(maxPositive(instance.HeartbeatTimeoutSeconds, defaultHeartbeatTimeoutSecs)) * time.Second
+	return !anchor.Add(timeout).After(now.UTC())
 }
 
 func parseCronSchedule(expr string) (cron.Schedule, error) {

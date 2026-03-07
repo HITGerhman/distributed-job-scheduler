@@ -16,4 +16,32 @@ docker compose -f "$COMPOSE_FILE" up -d mysql >/dev/null
 # Apply schema using container env MYSQL_ROOT_PASSWORD.
 docker compose -f "$COMPOSE_FILE" exec -T mysql sh -lc 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD"' < "$SCHEMA_FILE"
 
+ensure_column() {
+  local table_name=$1
+  local column_name=$2
+  local column_ddl=$3
+
+  local exists
+  exists=$(docker compose -f "$COMPOSE_FILE" exec -T mysql sh -lc \
+    "mysql -N -B -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -e \"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='DJS' AND table_name='${table_name}' AND column_name='${column_name}';\"")
+
+  if [[ "$exists" == "0" ]]; then
+    docker compose -f "$COMPOSE_FILE" exec -T mysql sh -lc \
+      "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -e \"USE DJS; ALTER TABLE ${table_name} ADD COLUMN ${column_name} ${column_ddl};\""
+  fi
+}
+
+ensure_column jobs max_retries "INT UNSIGNED NOT NULL DEFAULT 2 AFTER timeout_seconds"
+ensure_column jobs retry_backoff_seconds "INT UNSIGNED NOT NULL DEFAULT 2 AFTER max_retries"
+ensure_column jobs max_retry_backoff_seconds "INT UNSIGNED NOT NULL DEFAULT 30 AFTER retry_backoff_seconds"
+ensure_column jobs heartbeat_timeout_seconds "INT UNSIGNED NOT NULL DEFAULT 15 AFTER max_retry_backoff_seconds"
+
+ensure_column job_instances attempt "INT UNSIGNED NOT NULL DEFAULT 0 AFTER status"
+ensure_column job_instances max_attempts "INT UNSIGNED NOT NULL DEFAULT 1 AFTER attempt"
+ensure_column job_instances retry_backoff_seconds "INT UNSIGNED NOT NULL DEFAULT 2 AFTER max_attempts"
+ensure_column job_instances max_retry_backoff_seconds "INT UNSIGNED NOT NULL DEFAULT 30 AFTER retry_backoff_seconds"
+ensure_column job_instances heartbeat_timeout_seconds "INT UNSIGNED NOT NULL DEFAULT 15 AFTER max_retry_backoff_seconds"
+ensure_column job_instances next_retry_at "DATETIME(3) NULL AFTER heartbeat_timeout_seconds"
+ensure_column job_instances last_heartbeat_at "DATETIME(3) NULL AFTER next_retry_at"
+
 echo "schema applied: $SCHEMA_FILE"
