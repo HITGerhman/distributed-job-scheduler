@@ -9,6 +9,13 @@
 # Logs
 *.log
 
+# Python cache
+__pycache__/
+*.pyc
+
+# Local runtime artifacts
+runtime/
+
 # IDE
 .idea
 .vscode

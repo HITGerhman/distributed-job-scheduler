@@ -1,0 +1,62 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: djs-master
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: djs
+          role: master
+          service: djs
+          __path__: /var/log/djs/master-*.log
+    pipeline_stages:
+      - json:
+          expressions:
+            ts: ts
+            level: level
+            service: service
+            role: role
+            node_id: node_id
+            event: event
+            instance_id: instance_id
+            attempt_no: attempt_no
+      - labels:
+          service:
+          role:
+          node_id:
+          event:
+
+  - job_name: djs-worker
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: djs
+          role: worker
+          service: djs
+          __path__: /var/log/djs/worker-*.log
+    pipeline_stages:
+      - json:
+          expressions:
+            ts: ts
+            level: level
+            service: service
+            role: role
+            node_id: node_id
+            event: event
+            instance_id: instance_id
+            attempt_no: attempt_no
+      - labels:
+          service:
+          role:
+          node_id:
+          event:

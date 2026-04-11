@@ -1,0 +1,41 @@
+CREATE TABLE outbox_events (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'outbox 主键',
+    topic VARCHAR(128) NOT NULL COMMENT 'Kafka topic',
+    event_type VARCHAR(64) NOT NULL COMMENT '事件类型',
+    aggregate_type VARCHAR(64) NOT NULL COMMENT '聚合类型',
+    aggregate_id VARCHAR(128) NOT NULL COMMENT '聚合 ID',
+    event_key VARCHAR(255) NOT NULL COMMENT 'Kafka message key',
+    payload JSON NOT NULL COMMENT '完整事件 envelope',
+    headers JSON NOT NULL COMMENT 'Kafka headers / trace headers',
+    status VARCHAR(16) NOT NULL DEFAULT 'pending' COMMENT 'pending/sent',
+    retry_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '投递重试次数',
+    last_error TEXT DEFAULT NULL COMMENT '最近一次投递错误',
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '创建时间',
+    available_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '下次可投递时间',
+    sent_at DATETIME(3) DEFAULT NULL COMMENT '成功投递时间',
+    updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) COMMENT '更新时间',
+    PRIMARY KEY (id),
+    KEY idx_outbox_status_available (status, available_at),
+    KEY idx_outbox_event_type (event_type),
+    KEY idx_outbox_aggregate (aggregate_type, aggregate_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='生命周期事件 outbox';
+
+CREATE TABLE audit_events (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '审计事件主键',
+    event_id VARCHAR(64) NOT NULL COMMENT '事件唯一 ID',
+    event_type VARCHAR(64) NOT NULL COMMENT '事件类型',
+    aggregate_type VARCHAR(64) NOT NULL COMMENT '聚合类型',
+    aggregate_id VARCHAR(128) NOT NULL COMMENT '聚合 ID',
+    instance_id BIGINT UNSIGNED DEFAULT NULL COMMENT '实例 ID',
+    attempt_no INT UNSIGNED DEFAULT NULL COMMENT 'attempt 编号',
+    job_id BIGINT UNSIGNED DEFAULT NULL COMMENT 'job ID',
+    worker_id VARCHAR(128) DEFAULT NULL COMMENT 'worker ID',
+    trace_id VARCHAR(64) DEFAULT NULL COMMENT 'trace ID',
+    payload JSON NOT NULL COMMENT '完整事件 envelope',
+    received_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '消费落库时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uniq_audit_event_id (event_id),
+    KEY idx_audit_instance_attempt (instance_id, attempt_no),
+    KEY idx_audit_job_id (job_id),
+    KEY idx_audit_event_type (event_type)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='生命周期事件审计表';

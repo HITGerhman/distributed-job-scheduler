@@ -1,0 +1,206 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "max(djs_master_is_leader)",
+          "refId": "A"
+        }
+      ],
+      "title": "Leader Present",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "max(djs_workers_online)",
+          "refId": "A"
+        }
+      ],
+      "title": "Workers Online",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "max(djs_instances_pending)",
+          "legendFormat": "pending",
+          "refId": "A"
+        },
+        {
+          "expr": "max(djs_instances_running)",
+          "legendFormat": "running",
+          "refId": "B"
+        },
+        {
+          "expr": "max(djs_attempts_active)",
+          "legendFormat": "attempts_active",
+          "refId": "C"
+        }
+      ],
+      "title": "Queue And Runtime State",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "rate(djs_create_slots_total[5m])",
+          "legendFormat": "create_slots",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(djs_dispatch_total[5m])",
+          "legendFormat": "dispatch",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(djs_dispatch_rpc_failures_total[5m])",
+          "legendFormat": "dispatch_rpc_failures",
+          "refId": "C"
+        }
+      ],
+      "title": "Scheduler Throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
+      "id": 5,
+      "targets": [
+        {
+          "expr": "rate(djs_reconcile_timeouts_total[5m])",
+          "legendFormat": "reconcile_timeout {{reason}}",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(djs_stale_callbacks_total[5m])",
+          "legendFormat": "stale_callbacks",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(djs_kill_requests_total[5m])",
+          "legendFormat": "kill_requests",
+          "refId": "C"
+        }
+      ],
+      "title": "Fault Signals",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "djs",
+    "scheduler"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "timezone": "",
+  "title": "Scheduler Overview",
+  "uid": "djs-scheduler-overview",
+  "version": 1
+}

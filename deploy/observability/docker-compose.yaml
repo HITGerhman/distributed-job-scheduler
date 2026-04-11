@@ -1,0 +1,99 @@
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.1.10
+    container_name: djs-redpanda
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --check=false
+      - --overprovisioned
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --node-id=0
+      - --kafka-addr=PLAINTEXT://0.0.0.0:19092
+      - --advertise-kafka-addr=PLAINTEXT://127.0.0.1:19092
+    ports:
+      - "19092:19092"
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: djs-redis
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    ports:
+      - "16379:6379"
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: djs-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "14317:4317"
+      - "14318:4318"
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: djs-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.listen-address=0.0.0.0:9090
+    ports:
+      - "19090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-rules.yml:/etc/prometheus/prometheus-rules.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: djs-loki
+    command:
+      - -config.file=/etc/loki/local-config.yml
+    ports:
+      - "13100:3100"
+    volumes:
+      - ./loki-config.yml:/etc/loki/local-config.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: djs-promtail
+    command:
+      - -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./promtail-config.yml:/etc/promtail/config.yml:ro
+      - ../../runtime/logs:/var/log/djs:ro
+    depends_on:
+      - loki
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: djs-grafana
+    ports:
+      - "13000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - loki
+      - jaeger
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

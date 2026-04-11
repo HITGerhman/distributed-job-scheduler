@@ -1,0 +1,29 @@
+groups:
+  - name: djs-local-alerts
+    rules:
+      - alert: NoLeader
+        expr: max(djs_master_is_leader) < 1
+        for: 15s
+        labels:
+          severity: warning
+        annotations:
+          summary: No active leader detected
+          description: Master metrics currently report no leader in the local demo cluster.
+
+      - alert: NoWorkersOnline
+        expr: max(djs_workers_online) < 1
+        for: 15s
+        labels:
+          severity: warning
+        annotations:
+          summary: No online workers detected
+          description: Master metrics currently report zero workers online.
+
+      - alert: HeartbeatTimeoutSpike
+        expr: increase(djs_reconcile_timeouts_total{reason="heartbeat_timeout"}[5m]) > 0
+        for: 10s
+        labels:
+          severity: warning
+        annotations:
+          summary: Heartbeat timeout detected
+          description: Reconcile loop observed heartbeat timeout activity in the last five minutes.
