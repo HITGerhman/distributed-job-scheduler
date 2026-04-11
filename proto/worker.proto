@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package djs.worker.v1;
+
+option go_package = "djs/proto/workerpb";
+
+service WorkerService {
+  rpc DispatchTask (DispatchTaskRequest) returns (DispatchTaskResponse);
+  rpc KillTask (KillTaskRequest) returns (KillTaskResponse);
+}
+
+service MasterService {
+  rpc ReportStarted (ReportStartedRequest) returns (ReportStartedResponse);
+  rpc ReportFinished (ReportFinishedRequest) returns (ReportFinishedResponse);
+  rpc ReportHeartbeat (ReportHeartbeatRequest) returns (ReportHeartbeatResponse);
+  rpc CreateJob (CreateJobRequest) returns (CreateJobResponse);
+  rpc KillInstance (KillInstanceRequest) returns (KillInstanceResponse);
+}
+
+message DispatchTaskRequest {
+  uint64 instance_id = 1;
+  uint32 attempt_no = 2;
+  string worker_id = 3;
+  uint64 job_id = 4;
+  string job_name = 5;
+  bytes payload = 6;
+  uint32 timeout_seconds = 7;
+}
+
+message DispatchTaskResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message KillTaskRequest {
+  uint64 instance_id = 1;
+  uint32 attempt_no = 2;
+  string reason = 3;
+}
+
+message KillTaskResponse {
+  bool accepted = 1;
+  bool already_finished = 2;
+  string message = 3;
+}
+
+message ReportStartedRequest {
+  string worker_id = 1;
+  uint64 instance_id = 2;
+  uint32 attempt_no = 3;
+  int64 started_at_unix_ms = 4;
+}
+
+message ReportStartedResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message ReportFinishedRequest {
+  string worker_id = 1;
+  uint64 instance_id = 2;
+  uint32 attempt_no = 3;
+  string status = 4;
+  int64 finished_at_unix_ms = 5;
+  int32 exit_code = 6;
+  string error_message = 7;
+  bytes result_summary = 8;
+}
+
+message ReportFinishedResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message ReportHeartbeatRequest {
+  string worker_id = 1;
+  uint64 instance_id = 2;
+  uint32 attempt_no = 3;
+  int64 heartbeat_at_unix_ms = 4;
+}
+
+message ReportHeartbeatResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message CreateJobRequest {
+  string name = 1;
+  string cron_expr = 2;
+  string timezone = 3;
+  bytes payload = 4;
+  uint32 timeout_seconds = 5;
+  uint32 max_retries = 6;
+  uint32 retry_backoff_seconds = 7;
+  bool allow_concurrent = 8;
+  string status = 9;
+}
+
+message CreateJobResponse {
+  uint64 job_id = 1;
+}
+
+message KillInstanceRequest {
+  uint64 instance_id = 1;
+  string reason = 2;
+}
+
+message KillInstanceResponse {
+  bool accepted = 1;
+  string message = 2;
+}

@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DJS Runtime Theater</title>
+    <meta
+      name="description"
+      content="以真实本地数据驱动的 DJS 学习站。通过动画主舞台、任务闯关和源码联动，直观理解 create、dispatch、execute、relay 与 audit。">
+    <link rel="stylesheet" href="app.css?v=runtime-theater-4">
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero surface">
+        <div class="hero-copy">
+          <p class="eyebrow">DJS Runtime Theater</p>
+          <h1>把学习站变成一块会动的真实调度舞台</h1>
+          <p class="lede">
+            这不是一组假步骤，而是直接盯着你本地跑起来的 <code>master / worker / audit</code>、
+            <code>MySQL / etcd / Redis</code> 去看。点击创建 Job 后，舞台会沿着真实链路推进：
+            <code>CreateJob → instance → dispatch → heartbeat → finished → relay → audit</code>。
+          </p>
+          <div class="hero-actions">
+            <button type="button" class="button primary" id="hero-start" data-source-key="control.create_job">创建 Job</button>
+            <button type="button" class="button secondary" id="hero-await-instance" data-source-key="master.materialize_due_instances">等待 Instance</button>
+            <button type="button" class="button secondary" id="hero-advance-dispatch" data-source-key="master.dispatch">推进到 Dispatch</button>
+            <button type="button" class="button secondary" id="hero-refresh" data-source-key="master.dispatch">刷新状态</button>
+          </div>
+        </div>
+        <div class="hero-panel">
+          <div class="hero-kpi">
+            <span class="label">流连接</span>
+            <strong id="stream-state">connecting</strong>
+            <p id="stream-detail">正在连接 runtime stream…</p>
+          </div>
+          <div class="hero-kpi">
+            <span class="label">当前阶段</span>
+            <strong id="hero-stage">idle</strong>
+            <p id="hero-stage-detail">准备创建一轮真实 demo job。</p>
+          </div>
+          <div class="hero-kpi">
+            <span class="label">当前会话</span>
+            <strong id="hero-session">暂无会话</strong>
+            <p id="hero-session-detail">点击“开始任务”后会创建新的教学任务。</p>
+          </div>
+        </div>
+      </header>
+
+      <main>
+        <section class="surface theater-section" id="theater">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Main Stage</p>
+              <h2>动画主舞台</h2>
+            </div>
+            <div class="stage-badges">
+              <span class="badge" id="stage-badge">idle</span>
+              <span class="badge subtle" id="leader-badge">leader unknown</span>
+            </div>
+          </div>
+
+          <div class="control-bar">
+            <div class="control-cluster">
+              <button type="button" class="button primary" id="control-start" data-source-key="control.create_job">创建 Job</button>
+              <button type="button" class="button secondary" id="control-await-instance" data-source-key="master.materialize_due_instances">等待 Instance</button>
+              <button type="button" class="button secondary" id="control-advance-dispatch" data-source-key="master.dispatch">推进到 Dispatch</button>
+              <button type="button" class="button secondary" id="control-refresh" data-source-key="master.dispatch">刷新状态</button>
+              <button type="button" class="button secondary" id="control-replay">重放轨迹</button>
+            </div>
+            <div class="control-cluster focus-cluster">
+              <label class="focus-label" for="focus-select">聚焦实例</label>
+              <select id="focus-select" aria-label="聚焦实例"></select>
+              <button type="button" class="button secondary" id="focus-apply" data-source-key="master.dispatch">应用聚焦</button>
+            </div>
+            <div class="control-cluster lab-cluster">
+              <button type="button" class="button ghost" id="kill-button" data-source-key="master.kill_instance">Kill 当前实例</button>
+              <button type="button" class="button ghost" id="recent-refresh" data-source-key="master.outbox_relay">刷新 recent failures</button>
+            </div>
+          </div>
+
+          <article class="process-card">
+            <div class="card-head">
+              <div>
+                <p class="eyebrow">Local Cluster</p>
+                <h3>本地集群控制</h3>
+              </div>
+              <p class="card-tip">支持多 master 竞选和多 worker 注册。鼠标移到按钮上会显示启动命令。</p>
+            </div>
+            <div class="process-grid" id="process-grid"></div>
+          </article>
+
+          <div class="dependency-strip" id="dependency-strip" aria-live="polite"></div>
+          <div class="blocker-strip" id="blocker-strip" aria-live="polite"></div>
+
+          <div class="theater-layout">
+            <div class="stage-column">
+              <div class="runtime-stage" id="runtime-stage" aria-live="polite">
+                <div class="link-layer">
+                  <div class="stage-link" data-link="control-master" data-from="control" data-to="master"></div>
+                  <div class="stage-link" data-link="master-worker" data-from="master" data-to="worker"></div>
+                  <div class="stage-link" data-link="master-mysql" data-from="master" data-to="mysql"></div>
+                  <div class="stage-link" data-link="mysql-kafka" data-from="mysql" data-to="kafka"></div>
+                  <div class="stage-link" data-link="kafka-audit" data-from="kafka" data-to="audit"></div>
+                </div>
+                <div class="packet-layer" id="packet-layer" aria-hidden="true"></div>
+
+                <article class="actor-card actor-control" data-actor="control" data-source-key="control.create_job" data-pin-source="true">
+                  <span class="actor-tag">entry</span>
+                  <h3>Control</h3>
+                  <p>create / focus / kill</p>
+                  <strong class="actor-status" data-role-status="control">ready</strong>
+                  <small class="actor-detail" data-role-detail="control">等待创建 demo job</small>
+                </article>
+                <article class="actor-card actor-master" data-actor="master" data-source-key="master.dispatch" data-pin-source="true">
+                  <span class="actor-tag">orchestrator</span>
+                  <h3>Master</h3>
+                  <p>create / dispatch / reconcile / relay</p>
+                  <strong class="actor-status" data-role-status="master">watching</strong>
+                  <small class="actor-detail" data-role-detail="master">等待 leader</small>
+                </article>
+                <article class="actor-card actor-worker" data-actor="worker" data-source-key="worker.dispatch_task" data-pin-source="true">
+                  <span class="actor-tag">executor</span>
+                  <h3>Worker</h3>
+                  <p>run / heartbeat / callback</p>
+                  <strong class="actor-status" data-role-status="worker">waiting</strong>
+                  <small class="actor-detail" data-role-detail="worker">等待 dispatch</small>
+                </article>
+                <article class="actor-card actor-mysql" data-actor="mysql" data-source-key="master.materialize_due_instances" data-pin-source="true">
+                  <span class="actor-tag">truth</span>
+                  <h3>MySQL</h3>
+                  <p>jobs / instances / attempts / outbox</p>
+                  <strong class="actor-status" data-role-status="mysql">standby</strong>
+                  <small class="actor-detail" data-role-detail="mysql">等待真实状态</small>
+                </article>
+                <article class="actor-card actor-kafka" data-actor="kafka" data-source-key="master.outbox_relay" data-pin-source="true">
+                  <span class="actor-tag">relay</span>
+                  <h3>Kafka</h3>
+                  <p>outbox publish</p>
+                  <strong class="actor-status" data-role-status="kafka">idle</strong>
+                  <small class="actor-detail" data-role-detail="kafka">等待 outbox relay</small>
+                </article>
+                <article class="actor-card actor-audit" data-actor="audit" data-source-key="audit.consumer" data-pin-source="true">
+                  <span class="actor-tag">audit</span>
+                  <h3>Audit</h3>
+                  <p>idempotent insert</p>
+                  <strong class="actor-status" data-role-status="audit">idle</strong>
+                  <small class="actor-detail" data-role-detail="audit">等待事件落库</small>
+                </article>
+              </div>
+
+              <article class="summary-card">
+                <p class="eyebrow">Stage Summary</p>
+                <h3 id="summary-headline">准备开始</h3>
+                <p id="summary-text">点击创建 Job 后，舞台会切换到真实 demo job 的运行过程。</p>
+              </article>
+
+              <article class="slots-card" data-source-key="master.materialize_due_instances" data-pin-source="true">
+                <div class="card-head">
+                  <div>
+                    <p class="eyebrow">Time Slots</p>
+                    <h3>真实 cron 时间槽</h3>
+                  </div>
+                  <p class="card-tip">看它就能知道 leader 此刻会补哪些 slot，以及哪一个已经变成了 instance。</p>
+                </div>
+                <div class="slot-meta">
+                  <strong id="slot-window-title">等待 Job</strong>
+                  <p id="slot-window-detail">创建 Job 后，这里会显示 lookback / lookahead 窗口里的真实 slot。</p>
+                </div>
+                <div class="slot-legend">
+                  <span>window start <strong id="slot-window-start">—</strong></span>
+                  <span>now <strong id="slot-window-now">—</strong></span>
+                  <span>window end <strong id="slot-window-end">—</strong></span>
+                </div>
+                <div class="slot-track" id="slot-track" aria-live="polite"></div>
+              </article>
+
+              <div class="checkpoint-strip" id="checkpoint-strip" aria-live="polite"></div>
+
+              <article class="timeline-card">
+                <div class="card-head">
+                  <div>
+                    <p class="eyebrow">Timeline</p>
+                    <h3>本轮真实时间线</h3>
+                  </div>
+                  <p class="card-tip">鼠标移上去可以看关键源码，点击可以固定。</p>
+                </div>
+                <div class="timeline-list" id="timeline-list"></div>
+              </article>
+            </div>
+
+            <aside class="side-column">
+              <article class="mission-card">
+                <div class="card-head">
+                  <div>
+                    <p class="eyebrow">Mission</p>
+                    <h3>当前闯关状态</h3>
+                  </div>
+                  <span class="mission-pill" id="mission-pill">idle</span>
+                </div>
+                <div class="mission-meta" id="mission-meta"></div>
+                <div class="detail-grid">
+                  <section>
+                    <h4>可聚焦实例</h4>
+                    <div class="chip-list" id="instance-list"></div>
+                  </section>
+                  <section>
+                    <h4>在线 Worker</h4>
+                    <div class="chip-list" id="worker-list"></div>
+                  </section>
+                </div>
+                <div class="detail-grid">
+                  <section>
+                    <h4>Outbox</h4>
+                    <div class="mini-list" id="outbox-list"></div>
+                  </section>
+                  <section>
+                    <h4>Audit</h4>
+                    <div class="mini-list" id="audit-list"></div>
+                  </section>
+                </div>
+              </article>
+
+              <article class="source-card" id="source-card"></article>
+
+              <article class="lab-card">
+                <div class="card-head">
+                  <div>
+                    <p class="eyebrow">Lab</p>
+                    <h3>Recent Failures</h3>
+                  </div>
+                  <span class="mission-pill subtle" id="recent-source">waiting</span>
+                </div>
+                <p class="lab-copy">
+                  这个区块不是主舞台，但能让你看到 Redis 缓存命中与 MySQL 回源的区别。
+                </p>
+                <div class="mini-list" id="recent-failures"></div>
+              </article>
+            </aside>
+          </div>
+        </section>
+
+        <section class="surface notes-section">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Operator Notes</p>
+              <h2>怎么把这块舞台看明白</h2>
+            </div>
+          </div>
+          <div class="notes-grid">
+            <article class="note-card">
+              <h3>先看 MySQL，再看 RPC</h3>
+              <p>这个项目的“真相”在 MySQL。动画只是把写库、派发和回调重新编排成肉眼可见的节奏。</p>
+            </article>
+            <article class="note-card">
+              <h3>心跳是关键拐点</h3>
+              <p>一旦出现 heartbeat，就说明这不是停在 dispatched 的假热闹，而是 worker 真在执行。</p>
+            </article>
+            <article class="note-card">
+              <h3>Outbox 和 Audit 是后半程</h3>
+              <p>业务状态先落库，再 relay，再 audit。看到这两个节点亮起，就代表主线闭环完成。</p>
+            </article>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <p>学习站默认连接 <code>configs/local.yaml</code>。如果依赖没起来，页面会直接告诉你卡在哪个环节。</p>
+      </footer>
+    </div>
+
+    <script src="app.js?v=runtime-theater-4"></script>
+  </body>
+</html>

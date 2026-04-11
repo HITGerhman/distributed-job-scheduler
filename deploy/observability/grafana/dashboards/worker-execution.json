@@ -1,0 +1,143 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "targets": [
+        {
+          "expr": "rate(djs_worker_dispatch_received_total[5m])",
+          "legendFormat": "dispatch {{kind}}",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(djs_worker_started_total[5m])",
+          "legendFormat": "started",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(djs_worker_finished_total[5m])",
+          "legendFormat": "finished {{result}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Dispatch And Completion Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "rate(djs_worker_heartbeat_sent_total[5m])",
+          "legendFormat": "heartbeat_sent",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(djs_worker_report_retries_total[5m])",
+          "legendFormat": "report_retry {{kind}}",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(djs_worker_killed_total[5m])",
+          "legendFormat": "killed",
+          "refId": "C"
+        }
+      ],
+      "title": "Heartbeat / Retry / Kill",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(djs_worker_execution_duration_seconds_bucket[5m])) by (le, result))",
+          "legendFormat": "p50 {{result}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(djs_worker_execution_duration_seconds_bucket[5m])) by (le, result))",
+          "legendFormat": "p95 {{result}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Execution Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(djs_report_callback_duration_seconds_bucket[5m])) by (le, kind))",
+          "legendFormat": "callback p95 {{kind}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Callback Duration",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "djs",
+    "worker"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "timezone": "",
+  "title": "Worker Execution",
+  "uid": "djs-worker-execution",
+  "version": 1
+}

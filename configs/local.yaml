@@ -1,0 +1,65 @@
+app:
+  name: djs
+  role: master
+
+mysql:
+  dsn: root:password@tcp(127.0.0.1:13306)/djs?charset=utf8mb4&parseTime=true&loc=UTC
+
+etcd:
+  endpoints:
+    - 127.0.0.1:2379
+  dial_timeout: 5s
+  lease_ttl: 10s
+  election_prefix: /djs/leader
+  worker_prefix: /djs/workers
+
+grpc:
+  master_listen: 127.0.0.1:8080
+  master_advertise: 127.0.0.1:8080
+  worker_listen: 127.0.0.1:9090
+  worker_advertise: 127.0.0.1:9090
+  request_timeout: 5s
+
+scheduling:
+  create_interval: 5s
+  dispatch_interval: 2s
+  reconcile_interval: 5s
+  lookback: 2m
+  lookahead: 30s
+  dispatch_ack_timeout: 10s
+  heartbeat_timeout: 15s
+  batch_size: 100
+
+worker:
+  heartbeat_interval: 3s
+  kill_grace: 5s
+
+messaging:
+  brokers:
+    - 127.0.0.1:19092
+  topic_lifecycle: djs.lifecycle.v1
+  producer_batch_timeout: 5s
+  relay_interval: 3s
+  relay_batch_size: 100
+  consumer_group: djs-audit-consumer
+
+redis:
+  addr: 127.0.0.1:16379
+  password: ""
+  db: 0
+  snapshot_ttl: 30s
+  cache_ttl: 15s
+
+tracing:
+  enabled: true
+  service_name: djs
+  otlp_endpoint: 127.0.0.1:14317
+  sample_ratio: 1.0
+
+observability:
+  master_http_listen: 127.0.0.1:18080
+  worker_http_listen: 127.0.0.1:19080
+  metrics_namespace: djs
+  log_format: json
+  log_dir: runtime/logs
+  service_name: djs

@@ -1,176 +1,134 @@
 # DJS
 
-Distributed Job Scheduler. The project targets the core concerns of a small scheduling infrastructure service rather than a toy cron runner: multi-master leader election, worker discovery, at-least-once execution, retry and timeout recovery, forced kill, batched log ingestion, and Prometheus-style observability.
+一个时间驱动的分布式任务调度系统。
 
-## Quick Start
+## 当前阶段
 
-Requirements:
-- Docker / Docker Compose
-- Go 1.24+
-- Bash
+M4 生产味增强里程碑：
 
-One-command workflow:
+- master 在主事务边界写入 outbox，并以内嵌 relay 把生命周期事件发布到 Redpanda
+- `cmd/audit-consumer` 会消费 `djs.lifecycle.v1` 并落 `audit_events`
+- Redis 承担 worker 负载快照和 recent-failures 缓存
+- Loki 继续承担中心化日志，Jaeger 提供跨 `control -> master -> worker -> relay -> audit` 的 trace
 
-```bash
-make up
-make health
-make demo
-make test
-make down
-```
+当前仓库同时保留旧 MVP demo 作为参考和回归基线，但主实现面已经进到 M4 的增强层。
 
-What each target does:
-- `make up`: starts MySQL, Mongo, etcd, 3 masters, 1 worker; applies `schema.sql`; waits for leader election and health endpoints.
-- `make health`: prints cluster health, elected leader, worker state, and metrics endpoint readiness.
-- `make demo`: runs a 2-3 minute interview demo script covering create job, dispatch, kill, and leader failover.
-- `make demo-failover`: only runs the leader-switch fault drill.
-- `make test`: runs `go test ./...` and the live milestone 8 verification script.
-- `make down`: stops the compose stack.
+## 学习站
 
-If you want to present the demo step by step instead of letting it run through:
+如果你想先用更直观的方式认识项目，可以先启动本地学习站：
 
 ```bash
-DEMO_PAUSE=1 make demo
+./scripts/dev/run_learning_site.sh
 ```
 
-## Architecture
+默认地址：`http://127.0.0.1:17888`
 
-```mermaid
-flowchart LR
-    User[CLI / Make / Demo Scripts]
-    subgraph Master Plane
-        M1[master-1]
-        M2[master-2]
-        M3[master-3]
-    end
-    Etcd[(etcd)]
-    MySQL[(MySQL)]
-    Worker[worker-1]
-    Mongo[(Mongo)]
-    LocalLogs[(local log files)]
-    MetricsM[/master /metrics/]
-    MetricsW[/worker /metrics/]
+这个页面会把系统拓扑、create/dispatch/execute/callback/failover/outbox 主链路、双层状态机和推荐实验路线串起来，适合作为读代码前的“地图”。
 
-    User -->|HTTP create/trigger/get/kill| M1
-    User -->|HTTP create/trigger/get/kill| M2
-    User -->|HTTP create/trigger/get/kill| M3
-    M1 <-->|lease + txn + watch| Etcd
-    M2 <-->|lease + txn + watch| Etcd
-    M3 <-->|lease + txn + watch| Etcd
-    M1 -->|job / instance metadata| MySQL
-    M2 -->|job / instance metadata| MySQL
-    M3 -->|job / instance metadata| MySQL
-    M1 -->|RunJob / KillJob| Worker
-    M2 -->|RunJob / KillJob| Worker
-    M3 -->|RunJob / KillJob| Worker
-    Worker -->|ReportResult / heartbeat| M1
-    Worker -->|ReportResult / heartbeat| M2
-    Worker -->|ReportResult / heartbeat| M3
-    Worker --> LocalLogs
-    Worker -->|buffered batch flush| Mongo
-    M1 --> MetricsM
-    M2 --> MetricsM
-    M3 --> MetricsM
-    Worker --> MetricsW
-```
+## 核心文档
 
-Default demo deployment:
-- 3 masters, only 1 leader schedules at any moment
-- 1 worker in compose, but worker registration / round-robin selection already supports more
-- MySQL stores jobs and job instances
-- Mongo stores batched execution logs
-- etcd stores worker registrations and the leader lease key
+- [docs/00-onepager.md](/home/NEMO/DJS/docs/00-onepager.md)
+- [docs/03-data-model.md](/home/NEMO/DJS/docs/03-data-model.md)
+- [docs/04-state-machine.md](/home/NEMO/DJS/docs/04-state-machine.md)
+- [docs/07-m2-plan.md](/home/NEMO/DJS/docs/07-m2-plan.md)
+- [docs/08-create.md](/home/NEMO/DJS/docs/08-create.md)
+- [docs/09-dispatch.md](/home/NEMO/DJS/docs/09-dispatch.md)
+- [docs/10-kill.md](/home/NEMO/DJS/docs/10-kill.md)
+- [docs/11-failover.md](/home/NEMO/DJS/docs/11-failover.md)
+- [docs/12-m3-plan.md](/home/NEMO/DJS/docs/12-m3-plan.md)
+- [docs/13-observability.md](/home/NEMO/DJS/docs/13-observability.md)
+- [docs/14-local-observability-stack.md](/home/NEMO/DJS/docs/14-local-observability-stack.md)
+- [docs/15-m4-plan.md](/home/NEMO/DJS/docs/15-m4-plan.md)
+- [docs/16-events-and-outbox.md](/home/NEMO/DJS/docs/16-events-and-outbox.md)
+- [docs/17-redis-role.md](/home/NEMO/DJS/docs/17-redis-role.md)
+- [docs/18-central-logging.md](/home/NEMO/DJS/docs/18-central-logging.md)
+- [docs/19-tracing.md](/home/NEMO/DJS/docs/19-tracing.md)
+- [docs/20-m4-demo-runbook.md](/home/NEMO/DJS/docs/20-m4-demo-runbook.md)
+- [docs/21-resume-project-entry.md](/home/NEMO/DJS/docs/21-resume-project-entry.md)
+- [docs/22-quant-experiment-template.md](/home/NEMO/DJS/docs/22-quant-experiment-template.md)
+- [docs/23-project-architecture-context.md](/home/NEMO/DJS/docs/23-project-architecture-context.md)
+- [docs/24-concurrency-design.md](/home/NEMO/DJS/docs/24-concurrency-design.md)
+- [docs/25-production-like-scale-experiments.md](/home/NEMO/DJS/docs/25-production-like-scale-experiments.md)
 
-## 2-3 Minute Demo
+## 当前不做
 
-`make demo` runs the full script in [`scripts/demo.sh`](/home/nemo/projects/DJS/scripts/demo.sh):
+见 [docs/05-non-goals.md](/home/NEMO/DJS/docs/05-non-goals.md)。
 
-1. Cluster health summary
-2. Create a manual job and trigger it
-3. Show the instance reaches `SUCCESS` and display the worker-side log tail
-4. Create a long-running job, show it in `RUNNING`, then kill it
-5. Show the instance reaches `KILLED` and display `SIGTERM -> SIGKILL`
-6. Create a cron job, stop the current leader, wait for a new leader, and show cron execution continues
-7. Restart the old leader and disable the demo cron job
+## 本地运行
 
-For a focused fault drill:
+准备好 MySQL、etcd 和 Docker 后，推荐顺序如下：
 
 ```bash
-make demo-failover
+./scripts/dev/start_observability.sh
 ```
 
-## Interview Talk Track
+```bash
+go run ./cmd/master -config configs/local.yaml
+```
 
-If you need to explain the system in 2-3 minutes, this is the shortest defensible path:
+```bash
+go run ./cmd/worker -config configs/local.yaml
+```
 
-1. Jobs are created through the master HTTP API and persisted in MySQL.
-2. Three masters run simultaneously, but etcd lease + transaction election ensures only one leader schedules.
-3. Workers self-register into etcd; the leader discovers them and dispatches work over gRPC.
-4. Execution is at-least-once: the master retries on dispatch failure, worker loss, or heartbeat timeout; stale attempts are ignored.
-5. Worker logs are written both to local files and to a buffered Mongo batcher so high-frequency jobs do not turn log writes into the bottleneck.
-6. Prometheus metrics expose success rate, latency, retry counts, queue depth/high-water marks, worker log queue pressure, and leader switch count.
-7. The demo shows both the happy path and a real fault drill: force-kill a task, then kill the leader and watch the new leader continue scheduling.
+```bash
+./scripts/dev/run_audit_consumer.sh
+```
 
-## Key Design Choices
+```bash
+go run ./cmd/control -config configs/local.yaml -action create-job
+```
 
-### Why at-least-once instead of exactly-once
+观测入口：
 
-Exactly-once across distributed scheduling, worker crashes, and network failures is expensive and usually leaks complexity into the whole stack. This project chooses:
+- Grafana: `http://127.0.0.1:13000`
+- Prometheus: `http://127.0.0.1:19090`
+- Loki: `http://127.0.0.1:13100`
+- Jaeger: `http://127.0.0.1:16686`
+- master `/metrics|/healthz|/readyz`: `127.0.0.1:18080`
+- worker `/metrics|/healthz|/readyz`: `127.0.0.1:19080`
+- Redpanda: `127.0.0.1:19092`
+- Redis: `127.0.0.1:16379`
 
-- master-owned retries and timeout recovery
-- worker-side idempotency by `instance_id`
-- stale attempt rejection on `ReportResult`
+`payload` 支持两种最小形态：
 
-That gives a practical, debuggable at-least-once model that is common in real infrastructure systems.
+```json
+{"kind":"mock","duration_ms":1000,"result_summary":{"message":"ok"}}
+```
 
-### Why only the leader schedules
+```json
+{"kind":"shell","command":["/bin/sh","-lc","sleep 2"],"workdir":"","env":{}}
+```
 
-All masters stay hot, but only the elected leader runs the scheduler loop. This avoids duplicate cron triggering while still keeping failover fast. When the leader changes, the new leader:
+## 目录
 
-- resumes scheduling
-- catches up missed cron slots inside a bounded window
-- keeps duplicate creation under control through `job_id + scheduled_at` uniqueness
+```text
+djs/
+├─ cmd/
+│  ├─ demo/
+│  ├─ control/
+│  ├─ learn-site/
+│  ├─ master/
+│  └─ worker/
+├─ configs/
+├─ docs/
+├─ internal/
+│  ├─ app/
+│  ├─ domain/
+│  ├─ infra/
+│  ├─ registry/
+│  ├─ repository/
+│  ├─ service/
+│  ├─ store/
+│  ├─ transport/
+│  └─ worker/
+├─ migrations/
+├─ proto/
+└─ scripts/
+```
 
-### Why worker logs go to local file first, Mongo second
+## 备注
 
-Direct synchronous DB logging would turn noisy jobs into a storage bottleneck. The worker therefore:
-
-- always writes instance logs to local files for immediate forensic access
-- pushes log lines into a buffered channel
-- flushes them to Mongo by batch size or time window
-- exports queue depth, flush counts, dropped count, and Mongo availability metrics
-
-This means log persistence is observable and pressure can be explained during load tests.
-
-### Why queue metrics are event-driven and reconciled
-
-A pure polling gauge can miss short spikes. A pure in-memory gauge can drift if code paths change. The current design combines both:
-
-- event-driven updates at `PENDING/RUNNING/terminal` transitions
-- periodic DB reconciliation as a safety net
-
-That keeps queue high-water marks useful during demos and pressure tests.
-
-## Useful Endpoints
-
-- Master health: `http://127.0.0.1:8080/healthz`, `8081`, `8082`
-- Master metrics: `http://127.0.0.1:8080/metrics`, `8081`, `8082`
-- Worker health: `http://127.0.0.1:8083/healthz`
-- Worker metrics: `http://127.0.0.1:8083/metrics`
-
-## Repo Map
-
-- [`cmd/master/main.go`](/home/nemo/projects/DJS/cmd/master/main.go): master HTTP/gRPC API, scheduling, retries, leader reaction
-- [`cmd/worker/main.go`](/home/nemo/projects/DJS/cmd/worker/main.go): worker execution, heartbeat, kill handling
-- [`cmd/master/metrics.go`](/home/nemo/projects/DJS/cmd/master/metrics.go): master metrics and queue depth accounting
-- [`cmd/worker/log_batcher.go`](/home/nemo/projects/DJS/cmd/worker/log_batcher.go): buffered Mongo log batcher
-- [`internal/election/election.go`](/home/nemo/projects/DJS/internal/election/election.go): etcd leader election helper
-- [`internal/discovery/discovery.go`](/home/nemo/projects/DJS/internal/discovery/discovery.go): etcd worker registration and discovery
-- [`scripts/demo.sh`](/home/nemo/projects/DJS/scripts/demo.sh): full demo and failover drill
-- [`scripts/verify_milestone8.sh`](/home/nemo/projects/DJS/scripts/verify_milestone8.sh): high-frequency logging and observability verification
-
-## Notes
-
-- `make up` is idempotent and will re-apply schema upgrades.
-- `make demo` leaves the cluster running when it finishes.
-- The demo compose file currently uses one worker to keep the interview setup compact; the discovery path already supports multiple workers.
+- `cmd/demo` 和 `internal/service` / `internal/store` 是旧 MVP demo。
+- `cmd/master`、`cmd/worker`、`cmd/control`、`cmd/audit-consumer` 以及 `internal/app/*` 是当前主实现面。
+- `migrations/001_init.sql` 和 `migrations/002_outbox_and_audit.sql` 组成当前最小 schema。
+- 本地观测栈配置位于 `deploy/observability/`，日志目录位于 `runtime/logs/`。
